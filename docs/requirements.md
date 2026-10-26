@@ -117,7 +117,7 @@ spring:
 | `spring-boot-starter-opentelemetry` | R9 | 链路导出 |
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
 
-根 pom 的 `spring-ai-bom` 目前没有任何模块消费，要么删掉，要么写清留着做什么。
+根 pom 原先挂着 `spring-ai-bom` 但没有模块消费，已删：网关走 HTTP 透传，不需要 Spring AI 的模型抽象，留着只会让人以为这条链路依赖它。
 
 ## 六、实测记录
 
