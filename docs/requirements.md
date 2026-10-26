@@ -25,13 +25,13 @@
 | R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri` 引到备用路由 | 依赖缺失 |
 | R7 | 鉴权与租户隔离 | 无 key、错 key、已吊销 key 一律 401；租户身份贯穿日志、指标、限流键 | 自研 `GlobalFilter`，排在路由之前 | 自研 |
 | R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After` | `RequestRateLimiter` + 自定义 `KeyResolver` | 依赖缺失 |
-| R9 | 可观测 | 每个请求产出 `route / provider / model / 状态 / 耗时` 指标；traceId 贯穿 | `spring.cloud.gateway.server.webflux.metrics.*`，`observability.enabled` | 依赖缺失 |
-| R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 开箱可用 |
-| R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | SCG 无内置：`HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 缺口，见决策 D2 |
+| R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标；运维面不与业务端口共用 | 自建 `ai.gateway.requests` Timer + actuator 单独端口 | 已实现；traceId 与 TTFT 未做 |
+| R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 已实测，见决策 D4 |
+| R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | `HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 已实现，见决策 D2 |
 
 ## 三、决策
 
-三条现在不定、以后要重写的判断。
+四条现在不定、以后要重写的判断。
 
 ### D1 网关不改写报文
 
@@ -50,11 +50,24 @@
 
 per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 走 `Long.parseLong(metadata.get("response-timeout").toString())`，`getHttpClient` 走 `Integer.parseInt(...)`。写成 `response-timeout: 120s` 会抛 `NumberFormatException` 被 catch 掉、静默回落到全局值；`connect-timeout: 3s` 则异常没人接，直接让请求失败。键名来自 `RouteMetadataUtils`：`response-timeout`、`connect-timeout`。
 
+看门狗（R11）补上之后管到哪：`HttpClientCustomizer` 给上游通道加了 `ReadTimeoutHandler`，配置项是 `ai-gateway.upstream.idle-timeout`。两点要说清：
+
+- 粒度是**全局**，不是 per-route。`HttpClientCustomizer` 作用在构造网关那唯一 HttpClient 的时刻（`HttpClientFactory#applyCustomizers`），拿不到具体路由。按厂商给不同预算要另做（per-route HttpClient，或在过滤器链里自己包正文流）。
+- 客户端看到的是 `PrematureCloseException: Connection prematurely closed DURING response`——连接被掐，不是干净的结束标记，也没有可读的错误事件。看门狗保住的是网关自己的连接与线程；要不要替客户端把这次中断表达成一条 SSE 错误事件，是下一个决定，而它意味着要碰响应体，与 D1 相冲，所以留着没做。
+
 ### D3 重试默认不覆盖模型调用
 
 `RetryGatewayFilterFactory.Config` 的默认值是 `retries=3`、`series=[SERVER_ERROR]`、`statuses=[]`、`methods=[GET]`、`exceptions=[IOException, TimeoutException]`。模型调用全是 POST，不改 `methods` 等于没配重试。
 
 更紧的约束：响应已经开始流式下发之后重试，会把两份 token 拼给同一个客户端。重试只对「拿到响应头之前」失败的请求有意义，这条要进验收用例。
+
+### D4 可刷新的配置段必须是 JavaBean，不能是 record
+
+`ConfigurationPropertiesRebinder` 重绑的方式是 `Binder.bind(prefix, Bindable.ofInstance(bean))`——往**已有实例**里灌值。构造器绑定的 record 没有可灌的属性，于是重绑等于什么都没做：环境里的属性变了，bean 里还是旧的。
+
+实测过程：`AiGatewayProperties` 最初写成 record，Nacos 改 `ai-gateway.tenants.team-a.api-key` 之后日志明确打了 `refresh keys changed: [ai-gateway.tenants.team-a.api-key]`，但网关仍然认旧 key（旧 200、新 401）。改成带 getter/setter 的 JavaBean 之后，同一次改配置在 8 秒内生效，不重启。
+
+这也解释了为什么路由能热更而租户不能：SCG 自己的 `GatewayProperties` 就是 JavaBean。推论：凡是要靠 Nacos 刷新生效的配置段，一律 JavaBean；`@RefreshScope` 不是出路，record 是 final 类，CGLIB 代理不了。
 
 ## 四、配置
 
@@ -106,15 +119,14 @@ spring:
 
 ## 五、依赖缺口
 
-`gateway/pom.xml` 现在只有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR）与测试依赖。按需求清单还需要补：
+`gateway/pom.xml` 现在有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR）、`spring-boot-starter-actuator` 与 `micrometer-registry-prometheus`，外加测试依赖。按需求清单还缺：
 
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
 | `spring-cloud-starter-circuitbreaker-reactor-resilience4j` | R6 | `SpringCloudCircuitBreakerFilterFactory` 是条件装配，没依赖就没这个过滤器 |
 | `spring-boot-starter-data-redis-reactive` | R8 | `RedisRateLimiter`，跨实例配额才准 |
 | `com.bucket4j:bucket4j_jdk17-core` | R8 | SCG 把它标成 `optional`，用 `Bucket4jRateLimiter` 必须显式加；单机限流可以只要它 |
-| `spring-boot-starter-actuator` + `micrometer-registry-prometheus` | R9 | 现在连 `/actuator` 都没暴露 |
-| `spring-boot-starter-opentelemetry` | R9 | 链路导出 |
+| `spring-boot-starter-opentelemetry` | R9 的 traceId | 指标已有，链路还没有 |
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
 
 根 pom 原先挂着 `spring-ai-bom` 但没有模块消费，已删：网关走 HTTP 透传，不需要 Spring AI 的模型抽象，留着只会让人以为这条链路依赖它。
@@ -132,6 +144,12 @@ spring:
 | 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的 401 / 403 用例，断言桩的请求数为 0 |
 | 两条厂商路由各走自己的路径与 key，租户按 provider 隔离 | `GatewayChatFlowTest#eachProviderRouteCarriesItsOwnPathAndCredential` 与 `#tenantAllowedForOneProviderCannotUseAnotherProvidersRoute` |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
+| 厂商开始流式之后卡住，看门狗在空闲预算内切断 | `UpstreamIdleTimeoutTest#stalledStreamIsAbortedByIdleTimeout`：看门狗 400ms、响应头预算 5s，切断落在 350–2500ms 之间。与上一条是一对——同一个场景在关掉看门狗时 1.5 秒仍未结束 |
+| 看门狗不误伤持续吐字的长流 | `UpstreamIdleTimeoutTest#steadyStreamIsNotAffectedByIdleTimeout`：总时长 560ms 超过 400ms 预算，但间隔只有 80ms，完整收完 |
+| 指标带 tenant / provider / route / status 四个维度，被拒请求也计数 | `GatewayChatFlowTest#everyCallIsCountedPerTenantAndProviderIncludingRejections`；真机 `/actuator/prometheus` 上能看到 `ai_gateway_requests_seconds_count{provider="dashscope",route="dashscope-chat",status="200",tenant="team-a"}`，401 记成 `tenant="anonymous"` |
+| 改 Nacos 配置不重启即生效（R10） | 手工端到端：往 Nacos 发布 `ai-gateway.yaml` 覆盖租户 key，8 秒内新 key 从 401 变 200、旧 key 反向；record 版配置段做不到这件事，原因见决策 D4 |
+
+运维面与业务面分端口是实测过的：`management.server.port: 8089` 下 `/actuator/prometheus` 返回 200，而 8088 上同一路径返回 404。SCG 自带的指标在 Boot 4 / SCG 5 这套组合里叫 `http_client_requests_seconds`（tag 是 `spring_cloud_gateway_route_id` 等），没有租户维度——这是自建 `ai.gateway.requests` 的理由。
 
 `stream_options.include_usage` 两家都支持，但形状不一样：DashScope 在 `[DONE]` 之前**多给一个** `choices:[]` 的块带 `usage`；DeepSeek 把 `usage` 挂在 `finish_reason=stop` 那个块上。所以计量层不能假设「倒数第二个块」，要扫每个块取第一个带 `completion_tokens` 的。
 
@@ -152,7 +170,7 @@ spring:
 | 期 | 内容 | 完成标志 | 状态 |
 |---|---|---|---|
 | 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
-| 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | `response-timeout` 语义已测；R11 与 R9 未做 |
+| 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成；traceId 与 TTFT 留给 R9 的下一段 |
 | 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 未做 |
 | 四 | R3 模型路由与灰度 | 按 `$.model` 分流，权重切换不产生半处理连接 | 未做 |
-| 五 | 剩余两条实测回填 + R10 全链路演练 | 改 Nacos 配置即时生效，不断流 | 未做 |
+| 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |

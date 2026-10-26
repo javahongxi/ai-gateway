@@ -31,6 +31,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
+        // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
+        // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
+        // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉
+        "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
+        // 三个测试类各自一个上下文，固定运维端口会互相抢；测试里随机化
+        "management.server.port=0",
         "ai-gateway.tenants.team-a.api-key=sk-live-test"
 })
 class ProviderLiveTest {

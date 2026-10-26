@@ -1,30 +1,24 @@
 package org.hongxi.ai.gateway;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import reactor.core.Disposable;
-import reactor.core.publisher.Flux;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
-import org.springframework.core.io.buffer.DataBuffer;
-import org.springframework.core.io.buffer.DataBufferUtils;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.web.reactive.function.client.WebClient;
 
+import org.hongxi.ai.gateway.observability.RequestMetricsFilter;
+import org.hongxi.ai.gateway.support.GatewayCalls;
+import org.hongxi.ai.gateway.support.GatewayCalls.Outcome;
+import org.hongxi.ai.gateway.support.GatewayCalls.LiveCall;
 import org.hongxi.ai.gateway.support.StubUpstream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +34,15 @@ import static org.assertj.core.api.Assertions.assertThat;
         // 测试不连配置中心：路由与租户全部由下面的 DynamicPropertySource 与本 properties 给出
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
+        // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
+        // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
+        // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉
+        "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
+        // 本类要测的是「response-timeout 管不到流中途」，所以把 R11 的看门狗关掉；
+        // 它生效时的行为由 UpstreamIdleTimeoutTest 钉
+        "ai-gateway.upstream.idle-timeout=0",
+        // 三个测试类各自一个上下文，固定运维端口会互相抢；测试里随机化
+        "management.server.port=0",
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
         "ai-gateway.tenants.alpha.providers[0]=stub",
         "ai-gateway.tenants.beta.api-key=sk-beta",
@@ -70,7 +73,10 @@ class GatewayChatFlowTest {
     @LocalServerPort
     private int port;
 
-    private WebClient client;
+    @Autowired
+    private MeterRegistry registry;
+
+    private GatewayCalls calls;
 
     @DynamicPropertySource
     static void gatewayConfiguration(DynamicPropertyRegistry registry) {
@@ -100,18 +106,14 @@ class GatewayChatFlowTest {
 
     @BeforeEach
     void connectToGateway() {
-        // 直接 WebClient.create：Boot 4 把 WebClient 的自动配置拆进了独立模块
-        // spring-boot-webclient（org.springframework.boot.webclient.WebClientCustomizer 在那儿），
-        // 网关的依赖树里没有它，WebClient.Builder 这个 bean 不存在；WebClient 类本身来自
-        // spring-webflux，测试不必为了一个 Builder 加依赖
-        client = WebClient.create("http://127.0.0.1:" + port);
+        calls = new GatewayCalls("http://127.0.0.1:" + port, REQUEST_BODY);
         upstream.reset();
         upstream.scenario(StubUpstream.Scenario.ECHO_JSON);
     }
 
     @Test
     void missingApiKeyIsRejectedBeforeReachingTheProvider() {
-        Outcome outcome = call(null);
+        Outcome outcome = calls.call(CHAT_PATH, null);
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.UNAUTHORIZED.value());
         assertThat(outcome.body()).contains("\"code\":\"invalid_api_key\"");
@@ -120,7 +122,7 @@ class GatewayChatFlowTest {
 
     @Test
     void unknownApiKeyIsRejectedWithTheOpenAiErrorEnvelope() {
-        Outcome outcome = call("Bearer sk-not-a-real-key");
+        Outcome outcome = calls.call(CHAT_PATH, "Bearer sk-not-a-real-key");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.UNAUTHORIZED.value());
         assertThat(outcome.body())
@@ -133,7 +135,7 @@ class GatewayChatFlowTest {
 
     @Test
     void tenantCannotReachAProviderOutsideItsAllowlist() {
-        Outcome outcome = call("Bearer sk-beta");
+        Outcome outcome = calls.call(CHAT_PATH, "Bearer sk-beta");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.FORBIDDEN.value());
         assertThat(outcome.body()).contains("provider_not_allowed");
@@ -142,9 +144,7 @@ class GatewayChatFlowTest {
 
     @Test
     void eachProviderRouteCarriesItsOwnPathAndCredential() {
-        upstream.scenario(StubUpstream.Scenario.ECHO_JSON);
-
-        Outcome outcome = call(SECOND_CHAT_PATH, "Bearer sk-gamma");
+        Outcome outcome = calls.call(SECOND_CHAT_PATH, "Bearer sk-gamma");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(upstream.path()).as("第二条路由改写自己的厂商路径").isEqualTo("/upstream/second");
@@ -154,7 +154,7 @@ class GatewayChatFlowTest {
 
     @Test
     void tenantAllowedForOneProviderCannotUseAnotherProvidersRoute() {
-        Outcome outcome = call(SECOND_CHAT_PATH, "Bearer sk-alpha");
+        Outcome outcome = calls.call(SECOND_CHAT_PATH, "Bearer sk-alpha");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.FORBIDDEN.value());
         assertThat(outcome.body()).contains("stub2");
@@ -163,9 +163,7 @@ class GatewayChatFlowTest {
 
     @Test
     void nonStreamCallIsForwardedWithTheProviderCredentialAndAnUnchangedBody() {
-        upstream.scenario(StubUpstream.Scenario.ECHO_JSON);
-
-        Outcome outcome = call("Bearer sk-alpha");
+        Outcome outcome = calls.call(CHAT_PATH, "Bearer sk-alpha");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(outcome.body()).contains("chatcmpl-stub").contains("pong");
@@ -182,10 +180,10 @@ class GatewayChatFlowTest {
         upstream.scenario(StubUpstream.Scenario.SSE_STEADY);
         // 7 个元素 × 80ms ≈ 560ms，明显超过 300ms 的响应头预算
 
-        Outcome outcome = call("Bearer sk-alpha");
+        Outcome outcome = calls.call(CHAT_PATH, "Bearer sk-alpha");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.OK.value());
-        assertThat(reassembleDeltas(outcome.body())).isEqualTo(StubUpstream.STEADY_BODY);
+        assertThat(GatewayCalls.reassembleDeltas(outcome.body())).isEqualTo(StubUpstream.STEADY_BODY);
         assertThat(outcome.arrivals()).as("分块逐个交付，没有被攒成一整包").hasSizeGreaterThan(3);
         assertThat(outcome.arrivals().get(0)).isLessThan(RESPONSE_TIMEOUT_MILLIS);
         assertThat(outcome.elapsed())
@@ -198,7 +196,7 @@ class GatewayChatFlowTest {
         upstream.scenario(StubUpstream.Scenario.SILENT);
         // 桩 5 秒后才回响应头
 
-        Outcome outcome = call("Bearer sk-alpha");
+        Outcome outcome = calls.call(CHAT_PATH, "Bearer sk-alpha");
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.GATEWAY_TIMEOUT.value());
         assertThat(outcome.failure())
@@ -215,150 +213,43 @@ class GatewayChatFlowTest {
     @Test
     void midStreamStallIsNotCutOffByResponseTimeout() {
         upstream.scenario(StubUpstream.Scenario.SSE_THEN_SILENCE);
-        // 桩吐一块之后不再说话：这是 R11 的缺口，断言钉住当前行为
+        // 桩吐一块之后不再说话。这是 R11 存在的理由：本类的 response-timeout 是 300ms，
+        // 而流在 1.5 秒后仍然挂着——正文阶段没有任何超时。看门狗生效后的行为见
+        // UpstreamIdleTimeoutTest。
 
-        LiveCall live = new LiveCall("Bearer sk-alpha");
+        LiveCall live = calls.start(CHAT_PATH, "Bearer sk-alpha");
         live.awaitQuietly(Duration.ofMillis(1500));
 
         assertThat(live.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(live.body()).as("第一块已经交付给客户端").contains("Hi");
-        assertThat(live.terminated()).as("1.5 秒后流仍未结束：正文阶段没有空闲超时").isFalse();
+        assertThat(live.terminated()).as("1.5 秒后流仍未结束").isFalse();
         live.cancel();
     }
 
-    private Outcome call(String authorizationHeader) {
-        return call(CHAT_PATH, authorizationHeader);
+    @Test
+    void everyCallIsCountedPerTenantAndProviderIncludingRejections() {
+        // 同一个上下文里多个测试共用 registry，所以断言增量而不是绝对值
+        long okBefore = timerCount("alpha", "stub", "200");
+        long rejectedBefore = timerCount("anonymous", "stub", "401");
+
+        calls.call(CHAT_PATH, "Bearer sk-alpha");
+        calls.call(CHAT_PATH, null);
+
+        assertThat(timerCount("alpha", "stub", "200") - okBefore)
+                .as("成功请求按租户 + 厂商 + 状态计数")
+                .isEqualTo(1);
+        assertThat(timerCount("anonymous", "stub", "401") - rejectedBefore)
+                .as("被鉴权挡掉的请求也要计数，否则「某租户一直拿错 key 打网关」在指标里隐身")
+                .isEqualTo(1);
     }
 
-    private Outcome call(String path, String authorizationHeader) {
-        long started = System.nanoTime();
-        AtomicInteger status = new AtomicInteger();
-        List<String> pieces = new CopyOnWriteArrayList<>();
-        List<Long> arrivals = new CopyOnWriteArrayList<>();
-        AtomicReference<Throwable> failure = new AtomicReference<>();
-        try {
-            client.post()
-                    .uri(path)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .headers(headers -> setAuth(headers, authorizationHeader))
-                    .bodyValue(REQUEST_BODY)
-                    .exchangeToFlux(response -> {
-                        status.set(response.statusCode().value());
-                        return response.bodyToFlux(DataBuffer.class);
-                    })
-                    .doOnNext(buffer -> {
-                        pieces.add(read(buffer));
-                        arrivals.add(elapsed(started));
-                    })
-                    .then()
-                    .block(Duration.ofSeconds(10));
-        }
-        catch (RuntimeException timeoutOrAbort) {
-            failure.set(timeoutOrAbort);
-        }
-        return new Outcome(status.get(), String.join("", pieces), elapsed(started), List.copyOf(arrivals),
-                failure.get());
-    }
-
-    /** {@code null} 表示不带 Authorization，用来测「无 key」。 */
-    private static void setAuth(HttpHeaders headers, String authorizationHeader) {
-        if (authorizationHeader != null) {
-            headers.set(HttpHeaders.AUTHORIZATION, authorizationHeader);
-        }
-    }
-
-    private static long elapsed(long startedNanos) {
-        return (System.nanoTime() - startedNanos) / 1_000_000;
-    }
-
-    private static String read(DataBuffer buffer) {
-        String text = buffer.toString(StandardCharsets.UTF_8);
-        DataBufferUtils.release(buffer);
-        return text;
-    }
-
-    /**
-     * 把 SSE 里的 {@code delta.content} 拼回原文。手写解析够用且不引依赖：桩的输出形状固定。
-     */
-    private static String reassembleDeltas(String sse) {
-        StringBuilder text = new StringBuilder();
-        for (String line : sse.split("\n")) {
-            int marker = line.indexOf("\"content\":\"");
-            if (marker < 0) {
-                continue;
-            }
-            int from = marker + "\"content\":\"".length();
-            int to = line.indexOf('"', from);
-            if (to > from) {
-                text.append(line, from, to);
-            }
-        }
-        return text.toString();
-    }
-
-    /**
-     * 一次已经发出的请求，能在它还在跑的时候观察状态码、已到达的分块与到达时刻。
-     */
-    private final class LiveCall {
-
-        private final AtomicInteger status = new AtomicInteger();
-        private final List<String> pieces = new CopyOnWriteArrayList<>();
-        private final List<Long> arrivals = new CopyOnWriteArrayList<>();
-        private final AtomicBoolean terminated = new AtomicBoolean();
-        private final Disposable subscription;
-
-        private LiveCall(String authorizationHeader) {
-            Flux<DataBuffer> response = client.post()
-                    .uri(CHAT_PATH)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .headers(headers -> setAuth(headers, authorizationHeader))
-                    .bodyValue(REQUEST_BODY)
-                    .exchangeToFlux(it -> {
-                        status.set(it.statusCode().value());
-                        return it.bodyToFlux(DataBuffer.class);
-                    });
-            long started = System.nanoTime();
-            this.subscription = response
-                    .doOnNext(buffer -> {
-                        pieces.add(read(buffer));
-                        arrivals.add((System.nanoTime() - started) / 1_000_000);
-                    })
-                    .then()
-                    .subscribe(ignored -> {
-                    }, error -> terminated.set(true), () -> terminated.set(true));
-        }
-
-        void awaitQuietly(Duration patience) {
-            long deadline = System.nanoTime() + patience.toNanos();
-            while (System.nanoTime() < deadline && !terminated.get()) {
-                try {
-                    Thread.sleep(20);
-                }
-                catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
-
-        int status() {
-            return status.get();
-        }
-
-        String body() {
-            return String.join("", pieces);
-        }
-
-        boolean terminated() {
-            return terminated.get();
-        }
-
-        void cancel() {
-            subscription.dispose();
-        }
-    }
-
-    /** 一次请求的完整观测结果。 */
-    private record Outcome(int status, String body, long elapsed, List<Long> arrivals, Throwable failure) {
+    private long timerCount(String tenant, String provider, String status) {
+        Timer timer = registry.find(RequestMetricsFilter.REQUEST_METRIC)
+                .tag("tenant", tenant)
+                .tag("provider", provider)
+                .tag("status", status)
+                .timer();
+        // 一次都没发生过时 timer() 返回 null，不是 0——「before」读的就是这个空档
+        return timer == null ? 0 : timer.count();
     }
 }

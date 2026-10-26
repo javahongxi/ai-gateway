@@ -56,13 +56,30 @@ curl http://127.0.0.1:8088/deepseek/v1/chat/completions \
 {"error":{"message":"Missing API key: send an Authorization: Bearer <gateway key> header.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}
 ```
 
+## 观测
+
+运维面单独端口，不与 8088 的业务端口共用（8088 上 `/actuator/**` 是 404）：
+
+```
+curl -s http://127.0.0.1:8089/actuator/prometheus | grep ai_gateway_requests_seconds_count
+```
+
+```
+ai_gateway_requests_seconds_count{application="gateway",provider="dashscope",route="dashscope-chat",status="200",tenant="team-a"} 2
+ai_gateway_requests_seconds_count{application="gateway",provider="dashscope",route="dashscope-chat",status="401",tenant="anonymous"} 1
+```
+
+被鉴权挡掉的请求同样计数，且排在鉴权之前——否则「某租户一直拿错 key 打网关」在指标里是隐身的。SCG 自带的 `http_client_requests_seconds` 只有 route 维度，没有租户与厂商，这是自建一条指标的理由。
+
+上游流中途卡住由 `ai-gateway.upstream.idle-timeout` 兜（默认 60s）：路由 metadata 的 `response-timeout` 只管「等响应头」，正文阶段没有超时，见 `docs/requirements.md` 决策 D2。
+
 ## 测试
 
 ```
 mvn -pl gateway test
 ```
 
-9 个用例走进程内桩，不联网，覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块与超时语义。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
+12 个用例走进程内桩，不联网：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗（切断卡住的流、不误伤持续吐字的流）。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
 
 ```
 mvn -pl gateway test -Dtest=ProviderLiveTest

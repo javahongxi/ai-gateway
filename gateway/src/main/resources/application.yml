@@ -49,8 +49,25 @@ spring:
 
 # 自定义段用顶层前缀，不挤进 spring.*
 ai-gateway:
+  upstream:
+    # R11：上游已经开始回话之后，连续多久没有新字节就断开。路由 metadata 的 response-timeout
+    # 只管「等响应头」，管不到流中途（见 docs/requirements.md 决策 D2），所以要有这条。
+    # 它是空闲计时，厂商持续吐 token 时不会触发，长回答不受影响。设 0 关闭。
+    idle-timeout: 60s
   tenants:
     team-a:
       # 本地开发用的网关 key，与厂商 key 无关；上生产由 GATEWAY_TENANT_KEY 覆盖
       api-key: ${GATEWAY_TENANT_KEY:sk-team-a-local-dev}
       providers: [ dashscope, deepseek ]
+
+management:
+  # 运维面单独端口：8088 是对外的业务端口，不该顺带把 /actuator 暴露在同一面上
+  server:
+    port: 8089
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}

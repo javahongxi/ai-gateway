@@ -56,8 +56,10 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
 
     @Override
     public int getOrder() {
-        // 早于 NettyWriteResponseFilter(-1) 与 RouteToRequestUrlFilter(10000)
-        return Ordered.HIGHEST_PRECEDENCE;
+        // 让指标过滤器（HIGHEST_PRECEDENCE）排在前面：鉴权一旦短路，链就不再往下走，
+        // 排在后面的过滤器连那次拒绝都看不到。仍然早于 RouteToRequestUrlFilter(10000)
+        // 与 NettyWriteResponseFilter(-1)，所以请求绝不会在没身份时碰到厂商。
+        return Ordered.HIGHEST_PRECEDENCE + 10;
     }
 
     @Override
@@ -68,7 +70,7 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
                     "Missing API key: send an Authorization: Bearer <gateway key> header.");
         }
         Map<String, AiGatewayProperties.Tenant> tenants =
-                properties.tenants() == null ? Map.of() : properties.tenants();
+                properties.getTenants() == null ? Map.of() : properties.getTenants();
         String tenantName = matchTenant(tenants, presented);
         if (tenantName == null) {
             return reject(exchange, HttpStatus.UNAUTHORIZED, "invalid_request_error", "invalid_api_key",
@@ -111,7 +113,7 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
     private static String matchTenant(Map<String, AiGatewayProperties.Tenant> tenants, String presented) {
         byte[] actual = presented.getBytes(StandardCharsets.UTF_8);
         for (Map.Entry<String, AiGatewayProperties.Tenant> entry : tenants.entrySet()) {
-            String expected = entry.getValue().apiKey();
+            String expected = entry.getValue().getApiKey();
             if (!StringUtils.hasText(expected)) {
                 continue;
             }
