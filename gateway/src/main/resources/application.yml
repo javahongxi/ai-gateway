@@ -29,6 +29,15 @@ spring:
           # 路由表。Nacos 里的 ai-gateway.yaml 覆盖这一段，改完即时生效——
           # spring-cloud-gateway 的 RouteRefreshListener 监听配置刷新事件。
           # 上游凭证用 SetRequestHeader 注入：网关不改写报文，只换 host、归一 path、换 key。
+          #
+          # R6 拓扑：两家互为备份。公开路由挂熔断，失败时 forward 到一条内部备份路由，
+          # 由 DispatcherHandler 重新匹配——这是 CircuitBreaker 的 fallbackUri 能改道到
+          # 另一个厂商的原因（它 reset 掉上游连接后重走一遍 handler 分发）。
+          # 顺序要求：CircuitBreaker 必须排在 SetPath / SetRequestHeader **之前**。它改道时用的
+          # 是自己看到的那个 request，若厂商 key 已被前面的过滤器换进去，重投递时鉴权读到的
+          # 就是厂商 key，直接 401（实测踩过）。
+          # 一条现实约束：改道之后的请求体里 model 还是原厂商的名字，两家都能服务的模型才能这样
+          # 互为备份；要按厂商改写 model 就得动报文，与决策 D1 相冲，留给 R3 一并解决（见 D6）。
           routes:
             - id: dashscope-chat
               uri: https://dashscope.aliyuncs.com
@@ -42,6 +51,10 @@ spring:
                 response-timeout: 120000
                 connect-timeout: 3000
               filters:
+                - name: CircuitBreaker
+                  args:
+                    name: dashscope
+                    fallbackUri: forward:/backup/deepseek/v1/chat/completions
                 - SetPath=/compatible-mode/v1/chat/completions
                 - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
             # 一期用路径前缀区分厂商：客户端只把 base-url 换成
@@ -55,8 +68,36 @@ spring:
                 response-timeout: 120000
                 connect-timeout: 3000
               filters:
+                - name: CircuitBreaker
+                  args:
+                    name: deepseek
+                    fallbackUri: forward:/backup/dashscope/v1/chat/completions
                 - SetPath=/v1/chat/completions
                 - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
+            # 两条内部备份路由：只被 forward 命中，自己不再挂熔断（它们是最后那道防线）。
+            # 路径带 /backup/ 前缀，客户端不该直接打——真要指定厂商，用上面两条公开路由。
+            - id: backup-deepseek
+              uri: https://api.deepseek.com
+              predicates:
+                - Path=/backup/deepseek/v1/chat/completions
+              metadata:
+                provider: deepseek
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - SetPath=/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
+            - id: backup-dashscope
+              uri: https://dashscope.aliyuncs.com
+              predicates:
+                - Path=/backup/dashscope/v1/chat/completions
+              metadata:
+                provider: dashscope
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - SetPath=/compatible-mode/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
 
 # 自定义段用顶层前缀，不挤进 spring.*
 ai-gateway:
@@ -80,6 +121,26 @@ ai-gateway:
       # 本地开发用的网关 key，与厂商 key 无关；上生产由 GATEWAY_TENANT_KEY 覆盖
       api-key: ${GATEWAY_TENANT_KEY:sk-team-a-local-dev}
       providers: [ dashscope, deepseek ]
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        # 20 次滑动窗口、失败率过半就打开；打开后 30 秒放行一次探测
+        sliding-window-type: count_based
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 2
+  timelimiter:
+    configs:
+      default:
+        # spring-cloud-circuitbreaker 会把每次调用包在一个 TimeLimiter 里，而它的默认
+        # timeout-duration 是 1 秒——大模型调用没有 1 秒能回来的，等于每个请求都被判超时、
+        # 全部走 fallback。实测：主厂商 1.006 秒正常返回，客户端拿到的却是备用厂商的 400。
+        # 这里给到 120 秒，与路由的 response-timeout 对齐。
+        timeout-duration: 120s
 
 management:
   # 运维面单独端口：8088 是对外的业务端口，不该顺带把 /actuator 暴露在同一面上

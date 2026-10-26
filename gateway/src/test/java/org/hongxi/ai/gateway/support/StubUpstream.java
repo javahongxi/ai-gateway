@@ -1,5 +1,6 @@
 package org.hongxi.ai.gateway.support;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -33,7 +34,15 @@ public final class StubUpstream implements AutoCloseable {
         /** 吐一块之后不再说话：模拟厂商开始流式后卡住。 */
         SSE_THEN_SILENCE,
         /** 5 秒后才回第一个字节：模拟厂商接了连接但不出首块。 */
-        SILENT
+        SILENT,
+        /** 直接回 500：模拟厂商服务端故障，是熔断要认的那一类。 */
+        FAIL_500,
+        /** 吐一块之后把连接弄断：流已经开始下发，此时没法再改道备用厂商。 */
+        SSE_THEN_BREAK,
+        /** 1.5 秒后才回响应头：比 resilience4j TimeLimiter 的默认 1 秒慢，比模型调用快。 */
+        SLOW_HEAD,
+        /** 连接接了但立刻报错断开：模拟厂商进程被 kill -9，传输层失败。 */
+        RESET
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -50,6 +59,7 @@ public final class StubUpstream implements AutoCloseable {
     private final AtomicReference<String> tenant = new AtomicReference<>();
     private final AtomicReference<String> body = new AtomicReference<>();
     private final AtomicInteger requests = new AtomicInteger();
+    private final List<String> paths = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private StubUpstream(DisposableServer server) {
         this.server = server;
@@ -104,6 +114,16 @@ public final class StubUpstream implements AutoCloseable {
 
     public void reset() {
         requests.set(0);
+        paths.clear();
+    }
+
+    /** 每个请求落在桩上的路径，按到达顺序。failover 测试靠它区分主备。 */
+    public List<String> paths() {
+        return List.copyOf(paths);
+    }
+
+    public int hits(String path) {
+        return (int) paths.stream().filter(path::equals).count();
     }
 
     private Mono<Void> respond(HttpServerRequest request, HttpServerResponse response) {
@@ -116,11 +136,16 @@ public final class StubUpstream implements AutoCloseable {
                     tenant.set(request.requestHeaders().get("X-Tenant-Id"));
                     body.set(payload);
                     requests.incrementAndGet();
+                    paths.add(request.fullPath());
                     return switch (scenario.get()) {
                         case ECHO_JSON -> json(response);
                         case SSE_STEADY -> steadyStream(response);
                         case SSE_THEN_SILENCE -> firstChunkThenSilence(response);
                         case SILENT -> silent(response);
+                        case FAIL_500 -> fail500(response);
+                        case SSE_THEN_BREAK -> streamThenBreak(response);
+                        case SLOW_HEAD -> slowHead(response);
+                        case RESET -> Mono.error(new IOException("stub reset the connection"));
                     };
                 });
     }
@@ -163,6 +188,30 @@ public final class StubUpstream implements AutoCloseable {
         return response.status(200)
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
                 .sendString(Mono.delay(Duration.ofSeconds(5)).map(tick -> "data: too late\n\n"))
+                .then();
+    }
+
+    private Mono<Void> slowHead(HttpServerResponse response) {
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .sendString(Mono.delay(Duration.ofMillis(1500)).map(tick -> "{\"id\":\"chatcmpl-slow\"}"))
+                .then();
+    }
+
+    private Mono<Void> fail500(HttpServerResponse response) {
+        return response.status(500)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .sendString(Mono.just("{\"error\":{\"message\":\"upstream exploded\",\"type\":\"server_error\"}}"))
+                .then();
+    }
+
+    /** 先正常吐一块（响应头就此提交给客户端），再把流掐断。 */
+    private Mono<Void> streamThenBreak(HttpServerResponse response) {
+        Flux<String> broken = Flux.just(delta("Hi"))
+                .concatWith(Mono.error(new IllegalStateException("upstream went away mid-stream")));
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
+                .sendString(broken)
                 .then();
     }
 

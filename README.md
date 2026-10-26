@@ -97,13 +97,23 @@ X-Provider-RateLimit-Limit: 1
 {"error":{"message":"Provider 'deepseek' quota is exhausted, retry shortly.","type":"rate_limit_error","param":null,"code":"provider_rate_limit_exceeded"}}
 ```
 
+## 熔断与改道
+
+两家互为备份：`/v1/chat/completions`（DashScope）失败时 `forward` 到内部备份路由
+`/backup/deepseek/v1/chat/completions`，反之亦然。`CircuitBreaker` 必须排在
+`SetPath` / `SetRequestHeader` 之前，`resilience4j.timelimiter` 的默认 1 秒必须改大——两条都是实测出来的，
+理由写在 `docs/requirements.md` 决策 D6。
+
+只有 connect 级失败客户端能感知到改道；5xx、请求写出后被 reset、流到一半断这三种，熔断会计数、
+备用会被敲，但客户端拿到的仍是主厂商的结果。
+
 ## 测试
 
 ```
-mvn -pl gateway test
+mvn -pl gateway test          # 约 90 秒，熔断那类要真连死端口
 ```
 
-17 个用例走进程内桩与本机 Redis：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗；6 个覆盖限流键与 `Retry-After`；5 个走 Redis 里的真实桶（租户桶、厂商共用桶、状态确实在库里），本机没起 Redis 就整类 skip。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
+25 个用例走进程内桩与本机 Redis：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗；6 个覆盖限流键与 `Retry-After`；5 个走 Redis 里的真实桶（租户桶、厂商共用桶、状态确实在库里），本机没起 Redis 就整类 skip；8 个覆盖熔断与改道（含「慢不等于死」那条 TimeLimiter 回归）。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
 
 ```
 mvn -pl gateway test -Dtest=ProviderLiveTest

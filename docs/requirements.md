@@ -22,7 +22,7 @@
 | R3 | 模型路由与灰度 | 按请求体 `$.model` 选厂商；同一模型可按权重切流量 | `ReadBody` 谓词（JSONPath + SpEL），`Weight` 谓词 | 内置够用 |
 | R4 | 流式与超时 | 上游不回响应头时按预算返回 504；持续吐字的长回答不被总时长切断 | `routes[n].metadata.response-timeout`（毫秒） | 见决策 D2 |
 | R5 | 失败重试 | 只对尚未开始下发的请求重试；重试不重复计费 | `Retry` 过滤器 | 见决策 D3 |
-| R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri` 引到备用路由 | 依赖缺失 |
+| R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri: forward:...` 引到备用路由 | 已实现，见决策 D6 |
 | R7 | 鉴权与租户隔离 | 无 key、错 key、已吊销 key 一律 401；租户身份贯穿日志、指标、限流键 | 自研 `GlobalFilter`，排在路由之前 | 自研 |
 | R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After`，且请求不碰到厂商 | 租户走 `RequestRateLimiter` + 自定义 `KeyResolver`；厂商走自研 `ProviderQuotaFilter` | 已实现，见决策 D5 |
 | R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标；运维面不与业务端口共用 | 自建 `ai.gateway.requests` Timer + actuator 单独端口 | 已实现；traceId 与 TTFT 未做 |
@@ -31,7 +31,7 @@
 
 ## 三、决策
 
-五条现在不定、以后要重写的判断。
+六条现在不定、以后要重写的判断。
 
 ### D1 网关不改写报文
 
@@ -85,6 +85,23 @@ per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 
 
 顺带一条与 SCG 内置实现的差异：`RedisRateLimiter` 的键是 `request_rate_limiter.{routeId.id}.tokens`，带 routeId；所以同一个 `KeyResolver` 在不同路由上本来就是不同的桶。之前担心的「租户名与厂商名撞桶」在租户/厂商两维之间不会发生（它们在不同路由上也就算了，同一路由上 key 前缀 `tenant:` / `provider:` 仍然保留，是给人看的清楚）。
 
+### D6 熔断改道能走通，但只有「连不上」这一种客户端看得见
+
+`CircuitBreaker` 配 `fallbackUri` 之后的行为（读源码 + 桩实测）：失败时清掉响应状态、把
+`GATEWAY_REQUEST_URL_ATTR` 换成 fallback 路径、`ServerWebExchangeUtils.reset(exchange)` 释放上游连接，
+然后重新走一遍 `DispatcherHandler`。所以 fallback 能被**另一条路由**接住——这就是改道到备用厂商的通路，
+两条真实厂商互为备份的拓扑在 `application.yml` 里。它还会 `enableBodyCaching(routeId)`，请求体因此可重读，
+文档里那条「`ReadBody` 能不能重读」的未测卡点就是这个。
+
+四件事必须记下来：
+
+1. **`CircuitBreaker` 要排在 `SetPath` / `SetRequestHeader` 之前。** 它改道时用的是「自己看到的那个 request」；厂商 key 若已被前面的过滤器换进去，重投递时鉴权读到的是厂商 key，直接 401。这条是第一版实测撞出来的。
+2. **`resilience4j.timelimiter` 的默认 `timeout-duration` 是 1 秒。** spring-cloud-circuitbreaker 会把每次调用包在 TimeLimiter 里，大模型没有 1 秒回来的调用，于是**每个请求都被判超时走 fallback**。真机上表现为：qwen 请求正常返回，客户端却拿到 DeepSeek 回的 400。生产配置里显式给了 120s，与路由的 `response-timeout` 对齐；`CircuitBreakerFailoverTest#slowPrimaryIsNotMistakenForADeadOne` 钉住这条。
+3. **只有 connect 级失败能被客户端感知到改道。** 端口没人听 → 客户端拿到备用的 200。而「连上了、请求写出去了、然后 5xx / 被 reset / 流到一半断」这三类，熔断器会计数、备用厂商也会被敲，但客户端拿到的还是主厂商那个失败——响应已经开始走，替换不了。这未必是坏事：请求已经进了厂商，改道可能把同一次计费算两遍。
+4. **跨厂商改道带着一个模型名问题。** 请求体里的 `model` 是原厂商的名字，改道后新厂商多半不认识——真机实测：`qwen3.7-plus` 被改道到 DeepSeek，回来的是 `The supported API model names are deepseek-flash, deepseek-v4-pro`。要按厂商改写 `model` 就得动报文，与 D1 相冲；这件事和 R3 的「虚拟模型名 → 各厂商真实模型名」是同一个问题，留到四期一起解。
+
+还有一条环境性的：这台机器上「连一个没人听的端口」经网关要耗约 10 秒才失败（`curl` 直连是 0.2 毫秒），所以熔断用例的滑动窗口设成 2、真连死端口的用例只留两条，否则一个测试类要跑两分钟。
+
 ## 四、配置
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
@@ -135,11 +152,10 @@ spring:
 
 ## 五、依赖缺口
 
-`gateway/pom.xml` 现在有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`spring-boot-starter-data-redis`（R8 的桶状态）、`spring-boot-starter-actuator` + `micrometer-registry-prometheus`（R9）、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR），外加测试依赖。按需求清单还缺：
+`gateway/pom.xml` 现在有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`spring-cloud-starter-circuitbreaker-reactor-resilience4j`（R6）、`spring-boot-starter-data-redis`（R8 的桶状态）、`spring-boot-starter-actuator` + `micrometer-registry-prometheus`（R9）、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR），外加测试依赖。按需求清单还缺：
 
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
-| `spring-cloud-starter-circuitbreaker-reactor-resilience4j` | R6 | `SpringCloudCircuitBreakerFilterFactory` 是条件装配，没依赖就没这个过滤器 |
 | `spring-boot-starter-opentelemetry` | R9 的 traceId | 指标已有，链路还没有 |
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
 
@@ -159,6 +175,10 @@ spring:
 | 网关不改报文，只换 host / path / key，并加 `X-Tenant-Id` | `GatewayChatFlowTest#nonStreamCallIsForwardedWithTheProviderCredentialAndAnUnchangedBody`：桩收到的 body 与请求体逐字节相同 |
 | 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的 401 / 403 用例，断言桩的请求数为 0 |
 | 两条厂商路由各走自己的路径与 key，租户按 provider 隔离 | `GatewayChatFlowTest#eachProviderRouteCarriesItsOwnPathAndCredential` 与 `#tenantAllowedForOneProviderCannotUseAnotherProvidersRoute` |
+| 主厂商连不上时改道备用厂商，客户端拿到备用的 200 | `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup`：备用厂商收到 1 次、带自己的 key 与 `X-Tenant-Id` |
+| 熔断打开后不再敲主厂商 | `CircuitBreakerFailoverTest#breakerOpensAfterAWindowOfFailures` 与 `#openBreakerStillServesTheBackupWithoutWaitingOnThePrimary`：窗口 2、阈值 50%，打开之后那一次只打备用 |
+| 慢的主厂商不该被当成死的 | `CircuitBreakerFailoverTest#slowPrimaryIsNotMistakenForADeadOne`：1.5 秒回响应头，改道次数为 0。去掉 `resilience4j.timelimiter...timeout-duration` 这条就红——默认 1 秒会把每个模型调用判超时 |
+| 5xx / reset / 流中途断这三种改不了道 | `#serverErrorFromALivePrimaryIsNotReplacedByTheBackup`、`#connectionResetAfterTheRequestWasSentStillReturnsThePrimaryFailure`、`#midStreamFailureCannotBeFailedOver`：熔断计数与备用都被敲，客户端仍拿主厂商的结果 |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
 | 厂商开始流式之后卡住，看门狗在空闲预算内切断 | `UpstreamIdleTimeoutTest#stalledStreamIsAbortedByIdleTimeout`：看门狗 400ms、响应头预算 5s，切断落在 350–2500ms 之间。与上一条是一对——同一个场景在关掉看门狗时 1.5 秒仍未结束 |
 | 看门狗不误伤持续吐字的长流 | `UpstreamIdleTimeoutTest#steadyStreamIsNotAffectedByIdleTimeout`：总时长 560ms 超过 400ms 预算，但间隔只有 80ms，完整收完 |
@@ -182,8 +202,10 @@ spring:
 
 还剩两条没测，因为它们各自的实现还没写：
 
-1. `CircuitBreaker` 的 `fallbackUri` 二次进入路由链时，`ReadBody` 谓词能否重读请求体（`CacheRequestBody` 是否覆盖该路径）。这是备用厂商 failover 的唯一卡点。
-2. `Weight` 谓词与 `ReadBody` 组合在同一路由组上的匹配顺序，以及切权重时是否有连接被半处理。
+1. `Weight` 谓词与 `ReadBody` 组合在同一路由组上的匹配顺序，以及切权重时是否有连接被半处理。
+
+（原先列在这里的另一条——`fallbackUri` 二次进入路由链时请求体能不能重读——已由 D6 回答：配了
+`fallbackUri` 之后 `CircuitBreaker` 自己会 `enableBodyCaching(routeId)`。）
 
 ## 七、分期
 
@@ -193,6 +215,6 @@ spring:
 |---|---|---|---|
 | 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
 | 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成；traceId 与 TTFT 留给 R9 的下一段 |
-| 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | R8 已完成（两维 + 真机验证）；R6 未做 |
+| 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 已完成（两维限流 + 改道，边界见 D5/D6） |
 | 四 | R3 模型路由与灰度 | 按 `$.model` 分流，权重切换不产生半处理连接 | 未做 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |
