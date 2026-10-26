@@ -11,9 +11,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpStatus;
+import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import org.hongxi.ai.gateway.support.AlwaysAllowRateLimiter;
 import org.hongxi.ai.gateway.support.GatewayCalls;
 import org.hongxi.ai.gateway.support.GatewayCalls.LiveCall;
 import org.hongxi.ai.gateway.support.GatewayCalls.Outcome;
@@ -37,7 +39,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
         "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
-        "spring.cloud.gateway.server.webflux.default-filters=",
         "ai-gateway.upstream.idle-timeout=0",
         "management.server.port=0",
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
@@ -56,6 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         // 默认 1 秒——大模型没有 1 秒回来的调用，等于全部判超时走 fallback。见下面那条用例
         "resilience4j.timelimiter.configs.default.timeout-duration=120s"
 })
+@Import(AlwaysAllowRateLimiter.class)
 class CircuitBreakerFailoverTest {
 
     private static final String DEAD_PRIMARY_PATH = "/v1/chat/completions";

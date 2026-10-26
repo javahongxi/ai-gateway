@@ -39,6 +39,24 @@ spring:
           # 一条现实约束：改道之后的请求体里 model 还是原厂商的名字，两家都能服务的模型才能这样
           # 互为备份；要按厂商改写 model 就得动报文，与决策 D1 相冲，留给 R3 一并解决（见 D6）。
           routes:
+            # R3 模型路由：同一个 /v1/chat/completions 入口，按请求体里的 model 选厂商。
+            # 顺序就是优先级——SCG 取第一条匹配的路由，所以专名放前面、兜底放后面。
+            - id: deepseek-by-model
+              uri: https://api.deepseek.com
+              predicates:
+                - Path=/v1/chat/completions
+                - Model=deepseek*
+              metadata:
+                provider: deepseek
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: deepseek
+                    fallbackUri: forward:/backup/dashscope/v1/chat/completions
+                - SetPath=/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
             - id: dashscope-chat
               uri: https://dashscope.aliyuncs.com
               predicates:

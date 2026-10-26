@@ -19,7 +19,7 @@
 |---|---|---|---|---|
 | R1 | OpenAI 兼容入口 | 客户端只改 `base-url` 与 `model` 就能打下游多家；`/v1/chat/completions`、`/v1/embeddings`、`/v1/models` 三条路径可用 | `Path` + `Method` 谓词，`SetPath` / `RewritePath` | 内置够用 |
 | R2 | 厂商适配 | 一个请求只落一个厂商端点，网关不改写请求体与响应体 | 路由选择上游 host，`SetRequestHeader` 换 `Authorization`，`SetPath` 归一路径 | 见决策 D1 |
-| R3 | 模型路由与灰度 | 按请求体 `$.model` 选厂商；同一模型可按权重切流量 | `ReadBody` 谓词（JSONPath + SpEL），`Weight` 谓词 | 内置够用 |
+| R3 | 模型路由与灰度 | 按请求体里的 `model` 选厂商；同一模型可按权重切流量 | 自研 `Model` 谓词 + 内置 `Weight` 谓词 | 已实现，见决策 D7 |
 | R4 | 流式与超时 | 上游不回响应头时按预算返回 504；持续吐字的长回答不被总时长切断 | `routes[n].metadata.response-timeout`（毫秒） | 见决策 D2 |
 | R5 | 失败重试 | 只对尚未开始下发的请求重试；重试不重复计费 | `Retry` 过滤器 | 见决策 D3 |
 | R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri: forward:...` 引到备用路由 | 已实现，见决策 D6 |
@@ -31,7 +31,7 @@
 
 ## 三、决策
 
-六条现在不定、以后要重写的判断。
+七条现在不定、以后要重写的判断。
 
 ### D1 网关不改写报文
 
@@ -101,6 +101,32 @@ per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 
 4. **跨厂商改道带着一个模型名问题。** 请求体里的 `model` 是原厂商的名字，改道后新厂商多半不认识——真机实测：`qwen3.7-plus` 被改道到 DeepSeek，回来的是 `The supported API model names are deepseek-flash, deepseek-v4-pro`。要按厂商改写 `model` 就得动报文，与 D1 相冲；这件事和 R3 的「虚拟模型名 → 各厂商真实模型名」是同一个问题，留到四期一起解。
 
 还有一条环境性的：这台机器上「连一个没人听的端口」经网关要耗约 10 秒才失败（`curl` 直连是 0.2 毫秒），所以熔断用例的滑动窗口设成 2、真连死端口的用例只留两条，否则一个测试类要跑两分钟。
+
+### D7 模型路由自己实现一个谓词
+
+内置的 `ReadBody` 用不了多深：它的 `predicate` 参数类型是 `java.util.Predicate`，SCG 里没有
+String→Predicate 的转换器，配置里只能写 `#{...}` 去引用一个 Java 侧 bean——绕一圈还是得写 Java，
+却把匹配逻辑塞进一个 SpEL 字符串。而「按模型分流」是大模型网关的核心概念，值得有自己的谓词名。
+于是有了 `ModelRoutePredicateFactory`：配置写起来就是 `- Model=deepseek*`。
+
+读请求体的方式与 `ReadBody` 相同（`cacheRequestBodyAndRequest` + `ServerRequest.bodyToMono`），
+两件事因此被实测确认：谓词读过之后，转发给厂商的请求体**逐字节不变**
+（`ModelRoutingTest#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt`）；
+多条候选路由共用同一份缓存，第二次命中不会去重读一个已被消费的流
+（`#weightAndABodyReadingPredicateCoexistOnTheSameGroup`，文档里最后一条未测项就此结掉）。
+匹配用 `PatternMatchUtils` 的 `*` 通配而不是正则——模型名里全是点号、冒号和连字符。
+
+三条配套结论：
+
+- **路由顺序就是优先级。** SCG 取第一条匹配的路由，所以 `Model=deepseek*` 这类专名要排在兜底前面。
+- **虚拟模型名（一个名字后面挂多家）没做。** 它要求把 `model` 改写成各厂商的真实名字，也就是动报文，
+  与 D1 相冲。现在的做法是「客户端传什么名字就按名字选厂商」，两家都能服务的名字（如 `deepseek-*`）
+  才有跨厂商改道的意义。真要做，改写只发生在**请求**侧、且是几 KB 的一次性缓冲，不影响流式首字延迟，
+  代价是 D1 要开一个明确的例外——留到真有这个需求时再开。
+- **`default-filters` 清不掉。** `spring.cloud.gateway.server.webflux.default-filters=`（空值）不会
+  覆盖 yml 里那份列表——Boot 的集合绑定按索引逐个属性合并，空值不构成一次覆盖。实测表现：某个测试类
+  明明写了这句，连打 40 次之后第 34 次还是吃了 429。不测限流的类因此统一 `@Import` 一个
+  `AlwaysAllowRateLimiter`（`@Primary` 的 `RateLimiter`），而不是假装能清空配置。
 
 ## 四、配置
 
@@ -179,6 +205,11 @@ spring:
 | 熔断打开后不再敲主厂商 | `CircuitBreakerFailoverTest#breakerOpensAfterAWindowOfFailures` 与 `#openBreakerStillServesTheBackupWithoutWaitingOnThePrimary`：窗口 2、阈值 50%，打开之后那一次只打备用 |
 | 慢的主厂商不该被当成死的 | `CircuitBreakerFailoverTest#slowPrimaryIsNotMistakenForADeadOne`：1.5 秒回响应头，改道次数为 0。去掉 `resilience4j.timelimiter...timeout-duration` 这条就红——默认 1 秒会把每个模型调用判超时 |
 | 5xx / reset / 流中途断这三种改不了道 | `#serverErrorFromALivePrimaryIsNotReplacedByTheBackup`、`#connectionResetAfterTheRequestWasSentStillReturnsThePrimaryFailure`、`#midStreamFailureCannotBeFailedOver`：熔断计数与备用都被敲，客户端仍拿主厂商的结果 |
+| 同一个入口按 `model` 选厂商 | `ModelRoutingTest#modelDecidesTheProviderBehindOneSharedPath`；真机 `/v1/chat/completions` 传 `deepseek-v4-flash` 回显 `deepseek-flash`、传 `qwen3.7-plus` 回显 `qwen3.7-plus` |
+| 谓词读过请求体之后，转发出去的正文一字不变 | `ModelRoutingTest#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` |
+| 没人认领的模型名是 404，不是随便塞给某家 | `ModelRoutingTest#aModelNobodyClaimsIsNotFoundRatherThanSentSomewhere`：`glm-4-plus` → 404，上游请求数 0 |
+| 5:5 灰度真的两边分流量，且与读正文的谓词共存 | `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup`：40 次两边各 >5 次 |
+| 没有 JSON 正文的请求不会卡在谓词上 | `ModelRoutingTest#requestWithoutAJsonBodyDoesNotHangOnThePredicate` |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
 | 厂商开始流式之后卡住，看门狗在空闲预算内切断 | `UpstreamIdleTimeoutTest#stalledStreamIsAbortedByIdleTimeout`：看门狗 400ms、响应头预算 5s，切断落在 350–2500ms 之间。与上一条是一对——同一个场景在关掉看门狗时 1.5 秒仍未结束 |
 | 看门狗不误伤持续吐字的长流 | `UpstreamIdleTimeoutTest#steadyStreamIsNotAffectedByIdleTimeout`：总时长 560ms 超过 400ms 预算，但间隔只有 80ms，完整收完 |
@@ -200,12 +231,8 @@ spring:
 - **usage 是否带取决于厂商，真机不断言。** 同一份请求直连 DashScope 三次都带 usage，走网关的某一次却没带（5 次里 1 次，之后两次重跑又都带）。冒烟测试断言它等于把厂商的抖动引进 CI，所以这里只打印；扫描规则由上面的形状结论承载，等计量层落地时用桩钉。
 - **限流测试不能让真实时间参与。** 第一版写「桶 2、每秒补 1、第三次被拒」，三次调用本身要跑 0.5~1.8 秒，跨过秒界就补回一枚令牌，第三次反而放行——同一份代码连跑三次能给出两种结果。改成「桶 2、每次扣 2」之后，第二次必然要等两秒才可能放行，而两个本地调用之间只隔几十毫秒，断言就稳了。厂商那一维再加一个固定 `Clock` 注入，窗口键完全钉住。
 
-还剩两条没测，因为它们各自的实现还没写：
-
-1. `Weight` 谓词与 `ReadBody` 组合在同一路由组上的匹配顺序，以及切权重时是否有连接被半处理。
-
-（原先列在这里的另一条——`fallbackUri` 二次进入路由链时请求体能不能重读——已由 D6 回答：配了
-`fallbackUri` 之后 `CircuitBreaker` 自己会 `enableBodyCaching(routeId)`。）
+到这里，二、三期列出的未测项都结掉了：`fallbackUri` 与请求体重读见 D6，`Weight` 与读正文谓词的
+共存见 D7。剩下没做的都是新功能（traceId 与 TTFT、虚拟模型名、语义缓存那一层），不是没验的假设。
 
 ## 七、分期
 
@@ -216,5 +243,5 @@ spring:
 | 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
 | 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成；traceId 与 TTFT 留给 R9 的下一段 |
 | 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 已完成（两维限流 + 改道，边界见 D5/D6） |
-| 四 | R3 模型路由与灰度 | 按 `$.model` 分流，权重切换不产生半处理连接 | 未做 |
+| 四 | R3 模型路由与灰度 | 按 `model` 分流，权重切换不产生半处理连接 | 已完成（含真机验证），见 D7 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |

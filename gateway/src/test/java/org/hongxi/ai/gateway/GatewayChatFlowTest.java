@@ -12,10 +12,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpStatus;
+import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import org.hongxi.ai.gateway.observability.RequestMetricsFilter;
+import org.hongxi.ai.gateway.support.AlwaysAllowRateLimiter;
 import org.hongxi.ai.gateway.support.GatewayCalls;
 import org.hongxi.ai.gateway.support.GatewayCalls.Outcome;
 import org.hongxi.ai.gateway.support.GatewayCalls.LiveCall;
@@ -35,7 +37,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
-        "spring.cloud.gateway.server.webflux.default-filters=",
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
         // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
         // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉
@@ -52,6 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "ai-gateway.tenants.gamma.api-key=sk-gamma",
         "ai-gateway.tenants.gamma.providers[0]=stub2"
 })
+@Import(AlwaysAllowRateLimiter.class)
 class GatewayChatFlowTest {
 
     private static final String ROUTE = "spring.cloud.gateway.server.webflux.routes[0]";

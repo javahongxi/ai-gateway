@@ -37,8 +37,13 @@ public final class GatewayCalls {
         this.requestBody = requestBody;
     }
 
-    /** 发一次并等它结束（含失败）。{@code authorization} 为 null 表示不带 Authorization。 */
+    /** 用测试默认的请求体发一次。 */
     public Outcome call(String path, String authorization) {
+        return call(path, authorization, requestBody);
+    }
+
+    /** 发一次并等它结束（含失败）。{@code authorization} 为 null 表示不带 Authorization。 */
+    public Outcome call(String path, String authorization, String body) {
         long started = System.nanoTime();
         AtomicInteger status = new AtomicInteger();
         HttpHeaders responseHeaders = new HttpHeaders();
@@ -46,7 +51,7 @@ public final class GatewayCalls {
         List<Long> arrivals = new CopyOnWriteArrayList<>();
         AtomicReference<Throwable> failure = new AtomicReference<>();
         try {
-            body(path, authorization, status, responseHeaders)
+            body(path, authorization, body, status, responseHeaders)
                     .doOnNext(buffer -> {
                         pieces.add(read(buffer));
                         arrivals.add(elapsedSince(started));
@@ -64,10 +69,43 @@ public final class GatewayCalls {
     /** 发一次但不等它结束，用来观察「还挂着的那条流」现在怎么样了。 */
     public LiveCall start(String path, String authorization) {
         AtomicInteger status = new AtomicInteger();
-        return new LiveCall(status, body(path, authorization, status, new HttpHeaders()));
+        return new LiveCall(status, body(path, authorization, requestBody, status, new HttpHeaders()));
     }
 
-    private Flux<DataBuffer> body(String path, String authorization, AtomicInteger status,
+    /** 没有正文的一次 GET，用来看读正文的谓词会不会把请求挂住。 */
+    public Outcome get(String path, String authorization) {
+        long started = System.nanoTime();
+        AtomicInteger status = new AtomicInteger();
+        List<String> pieces = new CopyOnWriteArrayList<>();
+        List<Long> arrivals = new CopyOnWriteArrayList<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try {
+            client.get()
+                    .uri(path)
+                    .headers(headers -> {
+                        if (authorization != null) {
+                            headers.set(HttpHeaders.AUTHORIZATION, authorization);
+                        }
+                    })
+                    .exchangeToFlux(response -> {
+                        status.set(response.statusCode().value());
+                        return response.bodyToFlux(DataBuffer.class);
+                    })
+                    .doOnNext(buffer -> {
+                        pieces.add(read(buffer));
+                        arrivals.add(elapsedSince(started));
+                    })
+                    .then()
+                    .block(Duration.ofSeconds(20));
+        }
+        catch (RuntimeException timeoutOrAbort) {
+            failure.set(timeoutOrAbort);
+        }
+        return new Outcome(status.get(), String.join("", pieces), elapsedSince(started), List.copyOf(arrivals),
+                failure.get(), HttpHeaders.readOnlyHttpHeaders(new HttpHeaders()));
+    }
+
+    private Flux<DataBuffer> body(String path, String authorization, String body, AtomicInteger status,
             HttpHeaders capturedHeaders) {
         return client.post()
                 .uri(path)
@@ -77,7 +115,7 @@ public final class GatewayCalls {
                         headers.set(HttpHeaders.AUTHORIZATION, authorization);
                     }
                 })
-                .bodyValue(requestBody)
+                .bodyValue(body)
                 .exchangeToFlux(response -> {
                     status.set(response.statusCode().value());
                     capturedHeaders.putAll(response.headers().asHttpHeaders());

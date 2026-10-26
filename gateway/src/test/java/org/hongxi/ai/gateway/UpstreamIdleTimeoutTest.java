@@ -9,9 +9,11 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpStatus;
+import org.springframework.context.annotation.Import;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import org.hongxi.ai.gateway.support.AlwaysAllowRateLimiter;
 import org.hongxi.ai.gateway.support.GatewayCalls;
 import org.hongxi.ai.gateway.support.GatewayCalls.LiveCall;
 import org.hongxi.ai.gateway.support.StubUpstream;
@@ -32,7 +34,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
-        "spring.cloud.gateway.server.webflux.default-filters=",
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
         // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
         // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉
@@ -43,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
         "ai-gateway.tenants.alpha.providers[0]=stub"
 })
+@Import(AlwaysAllowRateLimiter.class)
 class UpstreamIdleTimeoutTest {
 
     private static final String ROUTE = "spring.cloud.gateway.server.webflux.routes[0]";

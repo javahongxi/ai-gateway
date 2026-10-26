@@ -97,6 +97,25 @@ X-Provider-RateLimit-Limit: 1
 {"error":{"message":"Provider 'deepseek' quota is exhausted, retry shortly.","type":"rate_limit_error","param":null,"code":"provider_rate_limit_exceeded"}}
 ```
 
+## 模型路由
+
+一个 `/v1/chat/completions` 入口，按请求体里的 `model` 选厂商；`Model` 是自定义谓词，
+配置里写 `- Model=deepseek*`。专名放前面、兜底放后面，因为 SCG 取第一条匹配的路由。
+同一个模型还能用 `Weight` 按权重切给两条路由做灰度。
+
+```
+curl -s http://127.0.0.1:8088/v1/chat/completions \
+  -H "Authorization: Bearer sk-team-a-local-dev" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一个词回答：海的颜色"}],"max_tokens":128}'
+```
+
+```
+{"id":"62fa081b-...","object":"chat.completion",...,"model":"deepseek-flash","choices":[{"index":0,"message":...
+```
+
+同一个请求把 `model` 换成 `qwen3.7-plus`，回来的就是 `"model":"qwen3.7-plus"`——厂商被名字换了，
+请求体一个字节没动。为什么不用内置的 `ReadBody`、虚拟模型名为什么没做，见 `docs/requirements.md` 决策 D7。
+
 ## 熔断与改道
 
 两家互为备份：`/v1/chat/completions`（DashScope）失败时 `forward` 到内部备份路由
@@ -110,10 +129,10 @@ X-Provider-RateLimit-Limit: 1
 ## 测试
 
 ```
-mvn -pl gateway test          # 约 90 秒，熔断那类要真连死端口
+mvn -pl gateway test          # 约 100 秒，熔断那类要真连死端口
 ```
 
-25 个用例走进程内桩与本机 Redis：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗；6 个覆盖限流键与 `Retry-After`；5 个走 Redis 里的真实桶（租户桶、厂商共用桶、状态确实在库里），本机没起 Redis 就整类 skip；8 个覆盖熔断与改道（含「慢不等于死」那条 TimeLimiter 回归）。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
+36 个用例走进程内桩与本机 Redis：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗；6 个覆盖限流键与 `Retry-After`；5 个走 Redis 里的真实桶（租户桶、厂商共用桶、状态确实在库里），本机没起 Redis 就整类 skip；8 个覆盖熔断与改道（含「慢不等于死」那条 TimeLimiter 回归）；5 个覆盖按 model 分流、谓词读完正文后请求体仍完整、5:5 灰度与未知模型 404。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
 
 ```
 mvn -pl gateway test -Dtest=ProviderLiveTest

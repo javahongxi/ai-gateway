@@ -15,8 +15,11 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.HttpHeaders;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
+
+import org.hongxi.ai.gateway.support.AlwaysAllowRateLimiter;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -32,7 +35,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
-        "spring.cloud.gateway.server.webflux.default-filters=",
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
         // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
         // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉
@@ -41,6 +43,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "management.server.port=0",
         "ai-gateway.tenants.team-a.api-key=sk-live-test"
 })
+@Import(AlwaysAllowRateLimiter.class)
 class ProviderLiveTest {
 
     /** 与 application.yml 里 team-a 的本地 key 一致即可，测试用上面的 properties 覆盖成定值。 */
