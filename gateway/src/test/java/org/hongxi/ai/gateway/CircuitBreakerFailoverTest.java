@@ -42,6 +42,13 @@ import static org.assertj.core.api.Assertions.assertThat;
         "ai-gateway.test-context=circuit-breaker",
         "spring.cloud.nacos.config.import-check.enabled=false",
         "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
+        // 这几条 ERROR 就是被测对象本身：流到一半断、响应已提交后无法再改。生产里它们正是
+        // 要看的信号，所以只在这个类里压掉，不动全局配置。
+        "logging.level.org.springframework.web.server.adapter.HttpWebHandlerAdapter=OFF",
+        "logging.level.reactor.netty.http.server.HttpServerOperations=OFF",
+        // 剩下几条（AbstractErrorWebExceptionHandler 的 500 与 PrematureCloseException 栈）
+        // 就是 reset 那条用例的正常产物，logger 名在 Boot 4 里挪过位置，不去逐个压——
+        // 生产上这两条正是要看的信号，为了日志干净把它们关掉是反的。
         "ai-gateway.upstream.idle-timeout=0",
         "management.server.port=0",
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
@@ -228,10 +235,12 @@ class CircuitBreakerFailoverTest {
     }
 
     @Test
-    void connectionResetAfterTheRequestWasSentStillReturnsThePrimaryFailure() {
-        // 与「连不上」相对的那一半：连上了、请求写出去了、然后被掐断。熔断器认这个失败并
-        // 打了备用厂商，但客户端拿到的还是 500——响应已经开始往客户端走了，改道结果替换不了它。
-        // 与 5xx 那条是同一类边界（见 serverErrorFromALivePrimaryIsNotReplacedByTheBackup）。
+    void connectionResetBeforeAnyResponseEndsAsAGatewayFiveHundred() {
+        // 连上了、请求写出去了、然后 socket 被掐。日志里是
+        // PrematureCloseException: Connection prematurely closed BEFORE response，
+        // 由 AbstractErrorWebExceptionHandler 落成 500。熔断器确实改道打了备用厂商一次，
+        // 但那个 500 还是到了客户端——传输层错误是从写响应那一侧冒出来的，绕过了熔断过滤器。
+        // 与 5xx 那条同属「改道发生但客户端看不见」这一类边界。
         upstream.scenario(StubUpstream.Scenario.RESET);
 
         Outcome outcome = calls.call(FLAKY_PRIMARY_PATH, "Bearer sk-alpha");

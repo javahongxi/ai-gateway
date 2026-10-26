@@ -98,6 +98,8 @@ per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 
 1. **`CircuitBreaker` 要排在 `SetPath` / `SetRequestHeader` 之前。** 它改道时用的是「自己看到的那个 request」；厂商 key 若已被前面的过滤器换进去，重投递时鉴权读到的是厂商 key，直接 401。这条是第一版实测撞出来的。
 2. **`resilience4j.timelimiter` 的默认 `timeout-duration` 是 1 秒。** spring-cloud-circuitbreaker 会把每次调用包在 TimeLimiter 里，大模型没有 1 秒回来的调用，于是**每个请求都被判超时走 fallback**。真机上表现为：qwen 请求正常返回，客户端却拿到 DeepSeek 回的 400。生产配置里显式给了 120s，与路由的 `response-timeout` 对齐；`CircuitBreakerFailoverTest#slowPrimaryIsNotMistakenForADeadOne` 钉住这条。
 3. **只有 connect 级失败能被客户端感知到改道。** 端口没人听 → 客户端拿到备用的 200。而「连上了、请求写出去了、然后 5xx / 被 reset / 流到一半断」这三类，熔断器会计数、备用厂商也会被敲，但客户端拿到的还是主厂商那个失败——响应已经开始走，替换不了。这未必是坏事：请求已经进了厂商，改道可能把同一次计费算两遍。
+
+   测这三类的桩修过两处，都值得记着：`RESET` 原先写的是 `Mono.error(new IOException(...))`，reactor-netty 会替它回一个 HTTP 500，于是那条叫「连接被 reset」的用例其实测的是 500，与隔壁 `FAIL_500` 重复（日志里 `Error starting response. Replying error status` 就是证据），现在改成不写任何响应、直接关 socket；改完的真实机制是 `PrematureCloseException: Connection prematurely closed BEFORE response` 被 `AbstractErrorWebExceptionHandler` 落成 500，说明传输层错误是从写响应那一侧冒出来的，绕过了熔断过滤器的作用域。`SSE_THEN_BREAK` 原先在吐一块之后立刻 `concatWith(Mono.error(...))`，错误可能赶在第一块 flush 之前把连接关掉，用例就在「收到一块」与「什么都没收到」之间飘，现在中间留 300ms。
 4. **跨厂商改道带着一个模型名问题。** 请求体里的 `model` 是原厂商的名字，改道后新厂商多半不认识——真机实测：`qwen3.7-plus` 被改道到 DeepSeek，回来的是 `The supported API model names are deepseek-flash, deepseek-v4-pro`。要按厂商改写 `model` 就得动报文，与 D1 相冲；这件事和 R3 的「虚拟模型名 → 各厂商真实模型名」是同一个问题，留到四期一起解。
 
 还有一条环境性的：这台机器上「连一个没人听的端口」经网关要耗约 10 秒才失败（`curl` 直连是 0.2 毫秒），所以熔断用例的滑动窗口设成 2、真连死端口的用例只留两条，否则一个测试类要跑两分钟。

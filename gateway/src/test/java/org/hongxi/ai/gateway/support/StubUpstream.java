@@ -152,7 +152,14 @@ public final class StubUpstream implements AutoCloseable {
                         case FAIL_500 -> fail500(response);
                         case SSE_THEN_BREAK -> streamThenBreak(response);
                         case SLOW_HEAD -> slowHead(response);
-                        case RESET -> Mono.error(new IOException("stub reset the connection"));
+                        case RESET -> {
+                            // 一个字节都不写，直接把 socket 关掉——这才是厂商进程被 kill 的样子。
+                            // 之前这里写的是 Mono.error(new IOException(...))，reactor-netty 会替它
+                            // 回一个 HTTP 500，于是那条用例测的其实是 500 而不是 reset（日志里
+                            // "Error starting response. Replying error status" 就是证据）。
+                            response.withConnection(connection -> connection.channel().close());
+                            yield Mono.empty();
+                        }
                     };
                 });
     }
@@ -212,10 +219,16 @@ public final class StubUpstream implements AutoCloseable {
                 .then();
     }
 
-    /** 先正常吐一块（响应头就此提交给客户端），再把流掐断。 */
+    /**
+     * 先正常吐一块（响应头就此提交给客户端），等 300ms 再把流掐断。
+     *
+     * <p>那 300ms 是必须的：直接 concatWith(Mono.error(...)) 时，错误可能赶在第一块 flush 出去
+     * 之前把连接关掉，客户端一个字节都收不到，用例就在「收到一块后断」和「什么都没收到」之间飘。
+     */
     private Mono<Void> streamThenBreak(HttpServerResponse response) {
         Flux<String> broken = Flux.just(delta("Hi"))
-                .concatWith(Mono.error(new IllegalStateException("upstream went away mid-stream")));
+                .concatWith(Mono.delay(Duration.ofMillis(300))
+                        .flatMap(tick -> Mono.error(new IllegalStateException("upstream went away mid-stream"))));
         return response.status(200)
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
                 .sendString(broken)
