@@ -8,6 +8,9 @@
         <version>4.1.1</version>
         <relativePath/> <!-- lookup parent from repository -->
     </parent>
+    <modules>
+        <module>gateway</module>
+    </modules>
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>org.hongxi</groupId>
