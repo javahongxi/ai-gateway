@@ -105,8 +105,14 @@ X-Provider-RateLimit-Limit: 1
 
 ## 模型路由
 
-一个 `/v1/chat/completions` 入口，按请求体里的 `model` 选厂商；`Model` 是自定义谓词，
-配置里写 `- Model=deepseek*`。专名放前面、兜底放后面，因为 SCG 取第一条匹配的路由。
+选厂商有两条路，各条路由都带同样的熔断与改道：
+
+- 不点名：一个 `/v1/chat/completions` 入口，按请求体里的 `model` 选厂商。`Model` 是自定义谓词，
+  配置里写 `- Model=deepseek*`；专名放前面、兜底放后面，因为 SCG 取第一条匹配的路由，
+  没匹配上任何专名的落到 dashscope。
+- 点名：改路径前缀，两家对称——`/dashscope/v1/chat/completions` 与 `/deepseek/v1/chat/completions`，
+  OpenAI SDK 那边就是换 `base_url`，不看 `model` 字段。
+
 同一个模型还能用 `Weight` 按权重切给两条路由做灰度。
 
 ```

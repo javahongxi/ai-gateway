@@ -181,7 +181,7 @@ spring:
             - id: deepseek-chat
               uri: https://api.deepseek.com
               predicates:
-                - Path=/deepseek/v1/chat/completions   # 客户端只改 base_url 的路径前缀
+                - Path=/deepseek/v1/chat/completions   # 点名厂商：改 base_url 的路径前缀
               metadata:
                 provider: deepseek
                 response-timeout: 120000

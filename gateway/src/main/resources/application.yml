@@ -75,8 +75,23 @@ spring:
                     fallbackUri: forward:/backup/deepseek/v1/chat/completions
                 - SetPath=/compatible-mode/v1/chat/completions
                 - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
-            # 一期用路径前缀区分厂商：客户端只把 base-url 换成
-            # http://127.0.0.1:8088/deepseek/v1 就切了上游。按 body 里的 model 分流是四期 R3。
+            # 指定厂商走路径前缀：客户端把 base_url 换成 .../dashscope/v1 或 .../deepseek/v1
+            # 就点名了厂商，不看 model 字段。不点名时由上面两条按 model 分流、兜底给 dashscope。
+            - id: dashscope-chat-direct
+              uri: https://dashscope.aliyuncs.com
+              predicates:
+                - Path=/dashscope/v1/chat/completions
+              metadata:
+                provider: dashscope
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: dashscope
+                    fallbackUri: forward:/backup/deepseek/v1/chat/completions
+                - SetPath=/compatible-mode/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
             - id: deepseek-chat
               uri: https://api.deepseek.com
               predicates:
