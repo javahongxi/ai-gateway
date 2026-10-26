@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>上游是进程内桩（{@link StubUpstream}），测试路由指向它。断言只落在两类事实上：桩收到了
  * 什么（证明 host / path / header 改写与「不改报文」），以及客户端按什么顺序看到什么（证明流式
- * 不被缓冲、超时管到哪一层）。真实厂商调用在 {@code DashScopeLiveTest}，缺 key 就 skip。
+ * 不被缓冲、超时管到哪一层）。真实厂商冒烟在 {@code ProviderLiveTest}，按每家的环境变量开关。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         // 测试不连配置中心：路由与租户全部由下面的 DynamicPropertySource 与本 properties 给出
@@ -43,13 +43,20 @@ import static org.assertj.core.api.Assertions.assertThat;
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
         "ai-gateway.tenants.alpha.providers[0]=stub",
         "ai-gateway.tenants.beta.api-key=sk-beta",
-        "ai-gateway.tenants.beta.providers[0]=someone-else"
+        "ai-gateway.tenants.beta.providers[0]=someone-else",
+        "ai-gateway.tenants.gamma.api-key=sk-gamma",
+        "ai-gateway.tenants.gamma.providers[0]=stub2"
 })
 class GatewayChatFlowTest {
 
     private static final String ROUTE = "spring.cloud.gateway.server.webflux.routes[0]";
 
+    private static final String SECOND_ROUTE = "spring.cloud.gateway.server.webflux.routes[1]";
+
     private static final String CHAT_PATH = "/v1/chat/completions";
+
+    /** 第二条厂商路由的路径，一期用路径前缀区分厂商。 */
+    private static final String SECOND_CHAT_PATH = "/deepseek/v1/chat/completions";
 
     /** 客户端发给网关的原始请求体，桩会把它原样收回，用来证明报文没被动过。 */
     private static final String REQUEST_BODY =
@@ -76,6 +83,14 @@ class GatewayChatFlowTest {
         registry.add(ROUTE + ".metadata.connect-timeout", () -> "1000");
         registry.add(ROUTE + ".filters[0]", () -> "SetPath=/upstream/chat");
         registry.add(ROUTE + ".filters[1]", () -> "SetRequestHeader=Authorization,Bearer provider-secret");
+        // 第二条厂商路由：同一个桩，不同的路径前缀、provider 与厂商 key
+        registry.add(SECOND_ROUTE + ".id", () -> "stub-chat-second");
+        registry.add(SECOND_ROUTE + ".uri", upstream::baseUrl);
+        registry.add(SECOND_ROUTE + ".predicates[0]", () -> "Path=" + SECOND_CHAT_PATH);
+        registry.add(SECOND_ROUTE + ".metadata.provider", () -> "stub2");
+        registry.add(SECOND_ROUTE + ".metadata.response-timeout", () -> String.valueOf(RESPONSE_TIMEOUT_MILLIS));
+        registry.add(SECOND_ROUTE + ".filters[0]", () -> "SetPath=/upstream/second");
+        registry.add(SECOND_ROUTE + ".filters[1]", () -> "SetRequestHeader=Authorization,Bearer second-secret");
     }
 
     @AfterAll
@@ -122,6 +137,27 @@ class GatewayChatFlowTest {
 
         assertThat(outcome.status()).isEqualTo(HttpStatus.FORBIDDEN.value());
         assertThat(outcome.body()).contains("provider_not_allowed");
+        assertThat(upstream.requests()).isZero();
+    }
+
+    @Test
+    void eachProviderRouteCarriesItsOwnPathAndCredential() {
+        upstream.scenario(StubUpstream.Scenario.ECHO_JSON);
+
+        Outcome outcome = call(SECOND_CHAT_PATH, "Bearer sk-gamma");
+
+        assertThat(outcome.status()).isEqualTo(HttpStatus.OK.value());
+        assertThat(upstream.path()).as("第二条路由改写自己的厂商路径").isEqualTo("/upstream/second");
+        assertThat(upstream.authorization()).isEqualTo("Bearer second-secret");
+        assertThat(upstream.tenant()).isEqualTo("gamma");
+    }
+
+    @Test
+    void tenantAllowedForOneProviderCannotUseAnotherProvidersRoute() {
+        Outcome outcome = call(SECOND_CHAT_PATH, "Bearer sk-alpha");
+
+        assertThat(outcome.status()).isEqualTo(HttpStatus.FORBIDDEN.value());
+        assertThat(outcome.body()).contains("stub2");
         assertThat(upstream.requests()).isZero();
     }
 
@@ -191,6 +227,10 @@ class GatewayChatFlowTest {
     }
 
     private Outcome call(String authorizationHeader) {
+        return call(CHAT_PATH, authorizationHeader);
+    }
+
+    private Outcome call(String path, String authorizationHeader) {
         long started = System.nanoTime();
         AtomicInteger status = new AtomicInteger();
         List<String> pieces = new CopyOnWriteArrayList<>();
@@ -198,7 +238,7 @@ class GatewayChatFlowTest {
         AtomicReference<Throwable> failure = new AtomicReference<>();
         try {
             client.post()
-                    .uri(CHAT_PATH)
+                    .uri(path)
                     .contentType(MediaType.APPLICATION_JSON)
                     .headers(headers -> setAuth(headers, authorizationHeader))
                     .bodyValue(REQUEST_BODY)

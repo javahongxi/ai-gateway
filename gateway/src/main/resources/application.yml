@@ -33,10 +33,24 @@ spring:
               filters:
                 - SetPath=/compatible-mode/v1/chat/completions
                 - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
+            # 一期用路径前缀区分厂商：客户端只把 base-url 换成
+            # http://127.0.0.1:8088/deepseek/v1 就切了上游。按 body 里的 model 分流是四期 R3。
+            - id: deepseek-chat
+              uri: https://api.deepseek.com
+              predicates:
+                - Path=/deepseek/v1/chat/completions
+              metadata:
+                provider: deepseek
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - SetPath=/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
 
 # 自定义段用顶层前缀，不挤进 spring.*
 ai-gateway:
   tenants:
     team-a:
+      # 本地开发用的网关 key，与厂商 key 无关；上生产由 GATEWAY_TENANT_KEY 覆盖
       api-key: ${GATEWAY_TENANT_KEY:sk-team-a-local-dev}
-      providers: [ dashscope ]
+      providers: [ dashscope, deepseek ]

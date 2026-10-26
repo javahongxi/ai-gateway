@@ -6,10 +6,11 @@
 
 ## 跑起来
 
-上游厂商 key 从环境变量读，不进仓库：
+上游厂商 key 从环境变量读，不进仓库。网关只认这两个变量，各条路由的 `SetRequestHeader` 引用自己的那家：
 
 ```
 export DASHSCOPE_API_KEY=sk-...
+export DEEPSEEK_API_KEY=sk-...
 mvn -pl gateway spring-boot:run          # 监听 8088
 ```
 
@@ -34,6 +35,19 @@ data: {"choices":[],"usage":{"completion_tokens":49,"completion_tokens_details":
 data: [DONE]
 ```
 
+换厂商只改路径前缀，OpenAI SDK 那边就是改 `base_url`：
+
+```
+curl http://127.0.0.1:8088/deepseek/v1/chat/completions \
+  -H "Authorization: Bearer sk-team-a-local-dev" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一个词回答：天空的颜色"}],"max_tokens":8}'
+```
+
+```
+{"id":"77b0947d-fa1a-4126-8a81-4f878908cb5a","object":"chat.completion",...,"model":"deepseek-flash","choices":[{"index":0,"message":{"role":"assistant","content":"蓝色"},...
+```
+
 没有 key 时请求不会碰到厂商，按 OpenAI 的错误信封返回 401：
 
 ```
@@ -46,8 +60,8 @@ data: [DONE]
 mvn -pl gateway test
 ```
 
-上游是进程内桩，不联网，7 个用例覆盖鉴权、租户隔离、凭证注入、报文原样、流式逐块与超时语义。真机冒烟单独跑，缺 `DASHSCOPE_API_KEY` 自动 skip：
+9 个用例走进程内桩，不联网，覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块与超时语义。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
 
 ```
-mvn -pl gateway test -Dtest=DashScopeLiveTest
+mvn -pl gateway test -Dtest=ProviderLiveTest
 ```

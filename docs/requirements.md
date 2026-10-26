@@ -87,13 +87,26 @@ spring:
               filters:
                 - SetPath=/compatible-mode/v1/chat/completions
                 - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY}
+            - id: deepseek-chat
+              uri: https://api.deepseek.com
+              predicates:
+                - Path=/deepseek/v1/chat/completions   # 客户端只改 base_url 的路径前缀
+              metadata:
+                provider: deepseek
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - SetPath=/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY}
 ```
 
-自定义段用顶层 `ai-gateway` 前缀，不挤进 `spring.*`。`providers` 与 `tenants` 需要 `@ConfigurationProperties` 类；`routes` 段走 SCG 原生绑定，`RouteRefreshListener` 已经在监听 `RefreshScopeRefreshedEvent`，Nacos 改配置触发 spring-cloud-context 刷新，路由随之重建，R10 不需要代码。
+自定义段用顶层 `ai-gateway` 前缀，不挤进 `spring.*`。`routes` 段走 SCG 原生绑定，`RouteRefreshListener` 已经在监听 `RefreshScopeRefreshedEvent`，Nacos 改配置触发 spring-cloud-context 刷新，路由随之重建，R10 不需要代码。
+
+一期实现的是 `tenants` 加手写 `routes`；上面的 `providers` 段是目标形状，等厂商数量多到路由表手写不动了再引入 `@ConfigurationProperties` 与路由生成，那时密钥池（同一家多把 key 轮转）一并解决。
 
 ## 五、依赖缺口
 
-`gateway/pom.xml` 目前只有 `spring-cloud-starter-gateway-server-webflux` 与 `spring-cloud-starter-alibaba-nacos-config`。按需求清单需要补：
+`gateway/pom.xml` 现在只有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR）与测试依赖。按需求清单还需要补：
 
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
@@ -116,10 +129,13 @@ spring:
 | 响应头之后的正文卡住**不会**被 `response-timeout` 切断 | `GatewayChatFlowTest#midStreamStallIsNotCutOffByResponseTimeout`：桩吐一块就沉默，1.5 秒后流仍未结束 → 这就是 R11 |
 | 流式不被网关缓冲，且总时长超过 `response-timeout` 仍能收完 | `GatewayChatFlowTest#streamIsDeliveredIncrementallyAndSurvivesPastTheResponseTimeout`：7 块 × 80ms，首块在预算内、总时长超预算 |
 | 网关不改报文，只换 host / path / key，并加 `X-Tenant-Id` | `GatewayChatFlowTest#nonStreamCallIsForwardedWithTheProviderCredentialAndAnUnchangedBody`：桩收到的 body 与请求体逐字节相同 |
-| 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的三个 401 / 403 用例，断言桩的请求数为 0 |
-| 真实端点流式经网关逐块到达 | `DashScopeLiveTest`（缺 `DASHSCOPE_API_KEY` 就 skip）：46 次到达，首块 648ms，末块 3651ms |
+| 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的 401 / 403 用例，断言桩的请求数为 0 |
+| 两条厂商路由各走自己的路径与 key，租户按 provider 隔离 | `GatewayChatFlowTest#eachProviderRouteCarriesItsOwnPathAndCredential` 与 `#tenantAllowedForOneProviderCannotUseAnotherProvidersRoute` |
+| 真机两家都通，SSE 原样透传、content-type 不改、`usage` 能扫到 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 40 次到达、`usage` 在第 38 块；deepseek-chat 3 次到达、`usage` 在第 2 块 |
 
 `stream_options.include_usage` 两家都支持，但形状不一样：DashScope 在 `[DONE]` 之前**多给一个** `choices:[]` 的块带 `usage`；DeepSeek 把 `usage` 挂在 `finish_reason=stop` 那个块上。所以计量层不能假设「倒数第二个块」，要扫每个块取第一个非 null 的 `usage`。
+
+顺带一条测法上的教训：**到达次数不能当断言**。同一次请求里 qwen 分了 40 次到达、deepseek 只有 3 次——厂商一次只回一个 token 时整条流就在两三个 TCP 读里走完。「逐块不缓冲」这条性质要用固定间隔的桩来测（7 块 × 80ms），真机冒烟只验「接得上、格式对、usage 扫得到」。
 
 还剩两条没测，因为它们各自的实现还没写：
 

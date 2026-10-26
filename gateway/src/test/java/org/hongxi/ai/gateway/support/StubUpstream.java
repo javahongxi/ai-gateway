@@ -21,7 +21,7 @@ import org.springframework.http.MediaType;
  * 并按场景决定响应是非流式 JSON、稳定节奏的 SSE、吐一块就沉默、还是整段不回话。
  *
  * <p>不用真实厂商做这些断言：超时与流式语义要毫秒级的节奏控制，真实端点给不了可重复的时序。
- * 真实调用在 {@code DashScopeLiveTest}，缺 key 就 skip。
+ * 真实调用在 {@code ProviderLiveTest}，按每家的环境变量开关。
  */
 public final class StubUpstream implements AutoCloseable {
 
