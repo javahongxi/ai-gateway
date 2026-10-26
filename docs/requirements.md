@@ -1,0 +1,139 @@
+# AI 网关需求
+
+基于 Spring Cloud Gateway 的大模型网关：对外提供 OpenAI 兼容接口，直连多家模型厂商，负责路由、鉴权、限流、熔断与观测。
+
+## 一、边界
+
+网关只负责把一次模型调用送到该去的厂商，并把响应原样流回来。四件事不在范围内：
+
+- 计费与配额结算。网关留下取用量的钩子和埋点，不落库、不出账。
+- 语义缓存与对话缓存。需要向量检索，属另一层。
+- 内容安全与敏感词。需要策略库与合规口径。
+- Prompt 编排、Agent、工具调用。属应用层。
+
+## 二、需求
+
+验收标准是这一层的核心：每条需求都写成能被一次请求证伪的形式。
+
+| # | 需求 | 验收标准 | Spring Cloud Gateway 5.0.2 落点 | 状态 |
+|---|---|---|---|---|
+| R1 | OpenAI 兼容入口 | 客户端只改 `base-url` 与 `model` 就能打下游多家；`/v1/chat/completions`、`/v1/embeddings`、`/v1/models` 三条路径可用 | `Path` + `Method` 谓词，`SetPath` / `RewritePath` | 内置够用 |
+| R2 | 厂商适配 | 一个请求只落一个厂商端点，网关不改写请求体与响应体 | 路由选择上游 host，`SetRequestHeader` 换 `Authorization`，`SetPath` 归一路径 | 见决策 D1 |
+| R3 | 模型路由与灰度 | 按请求体 `$.model` 选厂商；同一模型可按权重切流量 | `ReadBody` 谓词（JSONPath + SpEL），`Weight` 谓词 | 内置够用 |
+| R4 | 流式与超时 | 上游不回响应头时按预算返回 504；持续吐字的长回答不被总时长切断 | `routes[n].metadata.response-timeout`（毫秒） | 见决策 D2 |
+| R5 | 失败重试 | 只对尚未开始下发的请求重试；重试不重复计费 | `Retry` 过滤器 | 见决策 D3 |
+| R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri` 引到备用路由 | 依赖缺失 |
+| R7 | 鉴权与租户隔离 | 无 key、错 key、已吊销 key 一律 401；租户身份贯穿日志、指标、限流键 | 自研 `GlobalFilter`，排在路由之前 | 自研 |
+| R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After` | `RequestRateLimiter` + 自定义 `KeyResolver` | 依赖缺失 |
+| R9 | 可观测 | 每个请求产出 `route / provider / model / 状态 / 耗时` 指标；traceId 贯穿 | `spring.cloud.gateway.server.webflux.metrics.*`，`observability.enabled` | 依赖缺失 |
+| R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 开箱可用 |
+| R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | SCG 无内置：`HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 缺口，见决策 D2 |
+
+## 三、决策
+
+三条现在不定、以后要重写的判断。
+
+### D1 网关不改写报文
+
+`spring-cloud-gateway-server-webflux` 5.0.2 的 `filter/factory` 包里没有 `ModifyRequestBodyGatewayFilterFactory` 与 `ModifyResponseBodyGatewayFilterFactory`，只有 `CacheRequestBodyGatewayFilterFactory` 和 `RemoveJsonAttributesResponseBodyGatewayFilterFactory`。改写请求体要自己写 `ServerHttpRequestDecorator`，改写响应体在流式下意味着逐块解析再重组，首字延迟直接被做掉。
+
+所以适配只做三件事：选上游 host、换 `Authorization`、归一 path。厂商私有协议（例如 DashScope 原生 `/api/v1/services/aigc/...`）不在这一层接，要接就用它的 OpenAI 兼容端点。需要往请求体注入字段时（例如 `stream_options`），要求客户端自带，网关不代劳。
+
+### D2 response-timeout 管的是响应头，不管流中途
+
+`NettyRoutingFilter` 里被 `.timeout(responseTimeout, ...)` 包住的那个 `responseFlux`，来自 `httpClient.responseConnection((res, connection) -> ...)`——它在**上游响应头到达**时发出一个元素，之后就不再参与正文。所以：
+
+- 上游迟迟不回响应头：超时命中，`TimeoutException` 经 `onErrorMap` 变成 `ResponseStatusException(GATEWAY_TIMEOUT)`，客户端收到 504。
+- 响应头已经到达、正文卡在半路：这个超时**管不到**。`responseFlux.then(chain.filter(exchange))` 已经往下走了，正文由 `NettyWriteResponseFilter` 直接从连接里取，中间没有任何空闲检测。一条厂商不吐字的流式连接会一直挂着。
+
+对大模型场景，第一条是主要矛盾（推理模型的首字等待可能几十秒），预算按「发出请求到首块」估，不要按整段回答时长估。第二条是需要单独补的能力，见 R11。
+
+per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 走 `Long.parseLong(metadata.get("response-timeout").toString())`，`getHttpClient` 走 `Integer.parseInt(...)`。写成 `response-timeout: 120s` 会抛 `NumberFormatException` 被 catch 掉、静默回落到全局值；`connect-timeout: 3s` 则异常没人接，直接让请求失败。键名来自 `RouteMetadataUtils`：`response-timeout`、`connect-timeout`。
+
+### D3 重试默认不覆盖模型调用
+
+`RetryGatewayFilterFactory.Config` 的默认值是 `retries=3`、`series=[SERVER_ERROR]`、`statuses=[]`、`methods=[GET]`、`exceptions=[IOException, TimeoutException]`。模型调用全是 POST，不改 `methods` 等于没配重试。
+
+更紧的约束：响应已经开始流式下发之后重试，会把两份 token 拼给同一个客户端。重试只对「拿到响应头之前」失败的请求有意义，这条要进验收用例。
+
+## 四、配置
+
+dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
+
+三段配置，都放 Nacos：
+
+```yaml
+ai-gateway:
+  providers:      # 厂商注册表：别名 → base-url / 密钥引用 / 超时预算（毫秒）
+    dashscope: { base-url: https://dashscope.aliyuncs.com/compatible-mode, key-ref: ${DASHSCOPE_API_KEY}, response-timeout: 120000 }
+    deepseek:  { base-url: https://api.deepseek.com,                       key-ref: ${DEEPSEEK_API_KEY},  response-timeout: 120000 }
+  tenants:        # 租户 → key、可用厂商、配额
+    team-a: { api-key: ${GATEWAY_TENANT_KEY}, providers: [ dashscope, deepseek ] }
+
+spring:
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:   # 由 providers / tenants 生成，或手写；Weight 谓词承载灰度
+            - id: dashscope-chat
+              uri: https://dashscope.aliyuncs.com
+              predicates:
+                - Path=/v1/chat/completions
+              metadata:
+                provider: dashscope
+                response-timeout: 120000   # 毫秒，见决策 D2
+                connect-timeout: 3000
+              filters:
+                - SetPath=/compatible-mode/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY}
+```
+
+自定义段用顶层 `ai-gateway` 前缀，不挤进 `spring.*`。`providers` 与 `tenants` 需要 `@ConfigurationProperties` 类；`routes` 段走 SCG 原生绑定，`RouteRefreshListener` 已经在监听 `RefreshScopeRefreshedEvent`，Nacos 改配置触发 spring-cloud-context 刷新，路由随之重建，R10 不需要代码。
+
+## 五、依赖缺口
+
+`gateway/pom.xml` 目前只有 `spring-cloud-starter-gateway-server-webflux` 与 `spring-cloud-starter-alibaba-nacos-config`。按需求清单需要补：
+
+| 依赖 | 服务的需求 | 说明 |
+|---|---|---|
+| `spring-cloud-starter-circuitbreaker-reactor-resilience4j` | R6 | `SpringCloudCircuitBreakerFilterFactory` 是条件装配，没依赖就没这个过滤器 |
+| `spring-boot-starter-data-redis-reactive` | R8 | `RedisRateLimiter`，跨实例配额才准 |
+| `com.bucket4j:bucket4j_jdk17-core` | R8 | SCG 把它标成 `optional`，用 `Bucket4jRateLimiter` 必须显式加；单机限流可以只要它 |
+| `spring-boot-starter-actuator` + `micrometer-registry-prometheus` | R9 | 现在连 `/actuator` 都没暴露 |
+| `spring-boot-starter-opentelemetry` | R9 | 链路导出 |
+| `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
+
+根 pom 的 `spring-ai-bom` 目前没有任何模块消费，要么删掉，要么写清留着做什么。
+
+## 六、实测记录
+
+一期代码已把这些结论钉在测试里，改坏了测试会红。
+
+| 结论 | 怎么测出来的 |
+|---|---|
+| 上游响应头迟到 → 504，且按 per-route 预算触发 | `GatewayChatFlowTest#lateResponseHeadBecomesGatewayTimeout`：桩 5 秒才回头，预算 300ms |
+| 响应头之后的正文卡住**不会**被 `response-timeout` 切断 | `GatewayChatFlowTest#midStreamStallIsNotCutOffByResponseTimeout`：桩吐一块就沉默，1.5 秒后流仍未结束 → 这就是 R11 |
+| 流式不被网关缓冲，且总时长超过 `response-timeout` 仍能收完 | `GatewayChatFlowTest#streamIsDeliveredIncrementallyAndSurvivesPastTheResponseTimeout`：7 块 × 80ms，首块在预算内、总时长超预算 |
+| 网关不改报文，只换 host / path / key，并加 `X-Tenant-Id` | `GatewayChatFlowTest#nonStreamCallIsForwardedWithTheProviderCredentialAndAnUnchangedBody`：桩收到的 body 与请求体逐字节相同 |
+| 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的三个 401 / 403 用例，断言桩的请求数为 0 |
+| 真实端点流式经网关逐块到达 | `DashScopeLiveTest`（缺 `DASHSCOPE_API_KEY` 就 skip）：46 次到达，首块 648ms，末块 3651ms |
+
+`stream_options.include_usage` 两家都支持，但形状不一样：DashScope 在 `[DONE]` 之前**多给一个** `choices:[]` 的块带 `usage`；DeepSeek 把 `usage` 挂在 `finish_reason=stop` 那个块上。所以计量层不能假设「倒数第二个块」，要扫每个块取第一个非 null 的 `usage`。
+
+还剩两条没测，因为它们各自的实现还没写：
+
+1. `CircuitBreaker` 的 `fallbackUri` 二次进入路由链时，`ReadBody` 谓词能否重读请求体（`CacheRequestBody` 是否覆盖该路径）。这是备用厂商 failover 的唯一卡点。
+2. `Weight` 谓词与 `ReadBody` 组合在同一路由组上的匹配顺序，以及切权重时是否有连接被半处理。
+
+## 七、分期
+
+先跑通最小闭环，再补弹性与灰度。
+
+| 期 | 内容 | 完成标志 | 状态 |
+|---|---|---|---|
+| 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
+| 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | `response-timeout` 语义已测；R11 与 R9 未做 |
+| 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 未做 |
+| 四 | R3 模型路由与灰度 | 按 `$.model` 分流，权重切换不产生半处理连接 | 未做 |
+| 五 | 剩余两条实测回填 + R10 全链路演练 | 改 Nacos 配置即时生效，不断流 | 未做 |

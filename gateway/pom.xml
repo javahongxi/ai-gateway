@@ -20,6 +20,26 @@
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
         </dependency>
+        <!-- 网关用 Netty 的异步 DNS 解析厂商域名；macOS 上不装这个原生解析器，
+             启动与请求时会打 “Unable to load io.netty.resolver.dns.macos...” 的 ERROR，
+             解析退回 JDK 实现（功能不受影响，噪音影响排障）。版本由 Boot 的 BOM 管。 -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-resolver-dns-native-macos</artifactId>
+            <classifier>osx-aarch_64</classifier>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-test</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

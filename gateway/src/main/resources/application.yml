@@ -4,10 +4,39 @@ server:
 spring:
   application:
     name: gateway
+  # optional：Nacos 不可达时仍按本地路由启动，开发机与测试不必先起配置中心
+  config:
+    import:
+      - optional:nacos:ai-gateway.yaml?refreshEnabled=true&group=DEFAULT_GROUP
   cloud:
     nacos:
       config:
         serverAddr: 127.0.0.1:8848
-  config:
-    import:
-      - nacos:ai-gateway.properties?refreshEnabled=true&group=DEFAULT_GROUP
+    gateway:
+      server:
+        webflux:
+          # 路由表。Nacos 里的 ai-gateway.yaml 覆盖这一段，改完即时生效——
+          # spring-cloud-gateway 的 RouteRefreshListener 监听配置刷新事件。
+          # 上游凭证用 SetRequestHeader 注入：网关不改写报文，只换 host、归一 path、换 key。
+          routes:
+            - id: dashscope-chat
+              uri: https://dashscope.aliyuncs.com
+              predicates:
+                - Path=/v1/chat/completions
+              metadata:
+                provider: dashscope
+                # 单位是毫秒，且必须是数字：NettyRoutingFilter 用 Long.parseLong /
+                # Integer.parseInt 读这两个键，写 "120s" 会被静默忽略（response-timeout 回落到
+                # 全局值）或直接抛 NumberFormatException（connect-timeout）。见 docs/requirements.md D2
+                response-timeout: 120000
+                connect-timeout: 3000
+              filters:
+                - SetPath=/compatible-mode/v1/chat/completions
+                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
+
+# 自定义段用顶层前缀，不挤进 spring.*
+ai-gateway:
+  tenants:
+    team-a:
+      api-key: ${GATEWAY_TENANT_KEY:sk-team-a-local-dev}
+      providers: [ dashscope ]
