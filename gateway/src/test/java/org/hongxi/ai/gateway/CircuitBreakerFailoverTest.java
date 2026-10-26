@@ -93,7 +93,10 @@ class CircuitBreakerFailoverTest {
     static void gatewayConfiguration(DynamicPropertyRegistry registry) {
         // 主厂商 A：端口根本没人听，模拟「厂商整体不可用」。
         // 注意代价：每次连它要几秒才失败，所以这一维的用例数量要省着用。
-        route(registry, 0, "dead-primary", "http://127.0.0.1:1", DEAD_PRIMARY_PATH, "dead", "dead-provider");
+        // 「厂商整体不可用」用一个高位没人听的端口模拟。别用 127.0.0.1:1：这台机器上连特权端口
+        // 拿不到立即 RST，Netty 要等满约 10 秒才失败（实测 127.0.0.1:1 是 10.2 秒、
+        // 127.0.0.1:65000 是 0.28 秒），六次这样的尝试就是整个类多出来的那 60 秒。
+        route(registry, 0, "dead-primary", "http://127.0.0.1:65000", DEAD_PRIMARY_PATH, "dead", "dead-provider");
         // 备用厂商：两条主路由的 fallback 都指向它
         route(registry, 1, "backup", upstream.baseUrl(), BACKUP_PATH, "backup", null);
         // 主厂商 B：连得上，但会回 500 / 流到一半断，模拟「厂商活着、这次不行」
