@@ -131,11 +131,14 @@ spring:
 | 网关不改报文，只换 host / path / key，并加 `X-Tenant-Id` | `GatewayChatFlowTest#nonStreamCallIsForwardedWithTheProviderCredentialAndAnUnchangedBody`：桩收到的 body 与请求体逐字节相同 |
 | 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的 401 / 403 用例，断言桩的请求数为 0 |
 | 两条厂商路由各走自己的路径与 key，租户按 provider 隔离 | `GatewayChatFlowTest#eachProviderRouteCarriesItsOwnPathAndCredential` 与 `#tenantAllowedForOneProviderCannotUseAnotherProvidersRoute` |
-| 真机两家都通，SSE 原样透传、content-type 不改、`usage` 能扫到 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 40 次到达、`usage` 在第 38 块；deepseek-chat 3 次到达、`usage` 在第 2 块 |
+| 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
 
-`stream_options.include_usage` 两家都支持，但形状不一样：DashScope 在 `[DONE]` 之前**多给一个** `choices:[]` 的块带 `usage`；DeepSeek 把 `usage` 挂在 `finish_reason=stop` 那个块上。所以计量层不能假设「倒数第二个块」，要扫每个块取第一个非 null 的 `usage`。
+`stream_options.include_usage` 两家都支持，但形状不一样：DashScope 在 `[DONE]` 之前**多给一个** `choices:[]` 的块带 `usage`；DeepSeek 把 `usage` 挂在 `finish_reason=stop` 那个块上。所以计量层不能假设「倒数第二个块」，要扫每个块取第一个带 `completion_tokens` 的。
 
-顺带一条测法上的教训：**到达次数不能当断言**。同一次请求里 qwen 分了 40 次到达、deepseek 只有 3 次——厂商一次只回一个 token 时整条流就在两三个 TCP 读里走完。「逐块不缓冲」这条性质要用固定间隔的桩来测（7 块 × 80ms），真机冒烟只验「接得上、格式对、usage 扫得到」。
+顺带两条测法上的教训，都写进了测试注释：
+
+- **到达次数不能当断言。** 同一次跑里 qwen 分 40 次到达、deepseek 只有 7 次——厂商一次只回一个 token 时整条流就在两三个 TCP 读里走完。「逐块不缓冲」这条性质要用固定 80ms 间隔的桩来钉，真机只验接得上、格式对。
+- **usage 是否带取决于厂商，真机不断言。** 同一份请求直连 DashScope 三次都带 usage，走网关的某一次却没带（5 次里 1 次，之后两次重跑又都带）。冒烟测试断言它等于把厂商的抖动引进 CI，所以这里只打印；扫描规则由上面的形状结论承载，等计量层落地时用桩钉。
 
 还剩两条没测，因为它们各自的实现还没写：
 

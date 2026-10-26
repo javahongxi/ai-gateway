@@ -41,12 +41,14 @@ data: [DONE]
 curl http://127.0.0.1:8088/deepseek/v1/chat/completions \
   -H "Authorization: Bearer sk-team-a-local-dev" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"用一个词回答：天空的颜色"}],"max_tokens":8}'
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"用一个词回答：天空的颜色"}],"max_tokens":128}'
 ```
 
 ```
-{"id":"77b0947d-fa1a-4126-8a81-4f878908cb5a","object":"chat.completion",...,"model":"deepseek-flash","choices":[{"index":0,"message":{"role":"assistant","content":"蓝色"},...
+{"id":"94fae9bb-7c86-48d8-9e9a-c0df134179ff","object":"chat.completion",...,"model":"deepseek-flash","choices":[{"index":0,"message":{"role":"assistant","content":"蓝色"},...
 ```
+
+回显的 `model` 是厂商自己的别名（请求 `deepseek-v4-flash`，回来写 `deepseek-flash`），网关不改报文所以原样透出。`max_tokens` 给小了会全被思考过程吃掉：`deepseek-v4-flash` 与 `qwen3.7-plus` 都是推理模型，`max_tokens: 8` 时 `content` 是空的，思考占了几十个 token。
 
 没有 key 时请求不会碰到厂商，按 OpenAI 的错误信封返回 401：
 
