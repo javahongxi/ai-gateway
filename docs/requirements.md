@@ -133,7 +133,8 @@ String→Predicate 的转换器，配置里只能写 `#{...}` 去引用一个 Ja
 `spring-boot-starter-opentelemetry` 加上之后，实测三件事：
 
 - **厂商收得到 `traceparent`。** SCG 的 `ObservedRequestHttpHeadersFilter` 在发请求前把 W3C 头注进去，桩侧断言格式为 `00-<32hex>-<16hex>-<flags>`。这才是排障真正需要的东西：厂商侧日志能用同一个 id 对上。
-- **`management.tracing.export.enabled=false` 不是「只关导出」。** 设成 false 之后 tracer 不再产生，连 `traceparent` 都不注了——传播和导出是一套开关。所以生产配置保持 true；本地没有 collector 时导出静默失败，实测没有噪音。
+- **`management.tracing.export.enabled=false` 不是「只关导出」。** 设成 false 之后 tracer 不再产生，连 `traceparent` 都不注了——传播和导出是一套开关。所以生产配置保持 true。
+- **指标的 OTLP 推送要单独关。** `management.otlp.metrics.export.enabled: false`。先前我在文档里写「没有 collector 时导出静默失败、没有噪音」，那是错的：只 grep 了一次很短的输出就下了结论。实际是 `OtlpHttpMetricsSender` 每 30 秒往 `http://localhost:4318/v1/metrics` 推一次，一次全量测试里刷出 48 行 `ConnectException`。指标本来就已经由 8089 上的 `/actuator/prometheus` 被拉走，推 OTLP 是第二条通路，本地没有 collector 就是纯噪音。关掉之后同一次全量测试里 `ConnectException` 归零；traces 侧在这次跑里没有导出失败的记录。
 - **WebFlux + OTel bridge 下 MDC 里没有 traceId。** 请求执行中抓 `MDC.get("traceId")` 是 null，`Tracer.currentTraceContext()` 与 `ObservationRegistry.getCurrentObservation()` 也都是 null——reactive 没有线程绑定的 scope。所以日志格式里写 `%X{traceId}` 只会打出空括号，这句已从 `application.yml` 去掉。要修：加 OTel 的 logback-mdc instrumentation，或者从 Reactor Context 里取 span 自己写日志。这条以「已知缺口」的形式钉在 `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，修好了把断言反过来写，别删。
 
 ### 首字延迟挂在响应装饰器上
