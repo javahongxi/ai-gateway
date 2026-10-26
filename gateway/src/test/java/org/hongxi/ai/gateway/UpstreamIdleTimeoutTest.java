@@ -31,7 +31,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 来自看门狗，不会是被响应头超时顺手干的。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "spring.config.import=",
+        // 每个测试类一句自己的标记：Spring 的上下文缓存键只看合并后的配置，
+        // 不看 @DynamicPropertySource 贡献的值——两个类的光看注解会算同一个上下文，
+        // 路由表就被前一个类复用了（实测整类跑时指标断言会飘）。
+        "ai-gateway.test-context=idle-timeout",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了

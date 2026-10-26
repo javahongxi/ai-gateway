@@ -61,13 +61,19 @@ curl http://127.0.0.1:8088/deepseek/v1/chat/completions \
 运维面单独端口，不与 8088 的业务端口共用（8088 上 `/actuator/**` 是 404）：
 
 ```
-curl -s http://127.0.0.1:8089/actuator/prometheus | grep ai_gateway_requests_seconds_count
+curl -s http://127.0.0.1:8089/actuator/prometheus | grep ^ai_gateway_
 ```
 
 ```
-ai_gateway_requests_seconds_count{application="gateway",provider="dashscope",route="dashscope-chat",status="200",tenant="team-a"} 2
-ai_gateway_requests_seconds_count{application="gateway",provider="dashscope",route="dashscope-chat",status="401",tenant="anonymous"} 1
+ai_gateway_requests_seconds_count{application="gateway",provider="deepseek",route="deepseek-chat",status="200",tenant="team-a"} 1
+ai_gateway_requests_seconds_sum{application="gateway",provider="deepseek",route="deepseek-chat",status="200",tenant="team-a"} 2.056642
+ai_gateway_ttft_seconds_count{application="gateway",provider="deepseek",route="deepseek-chat",tenant="team-a"} 1
+ai_gateway_ttft_seconds_sum{application="gateway",provider="deepseek",route="deepseek-chat",tenant="team-a"} 1.454746
 ```
+
+`ttft` 是「进入网关到第一个字节交给客户端」，与整条请求的耗时分开记：一次 `max_tokens=200` 的流式回答，首字 1.45 秒、整条 2.06 秒，只看后者会把「多久开始吐字」和「一共吐了多久」混成一个数。
+
+traceId 由 `spring-boot-starter-opentelemetry` 提供，会作为 `traceparent` 传给厂商（厂商侧日志才能与网关对上）。两个坑记在决策 D8：`management.tracing.export.enabled=false` 会连传播一起关掉；WebFlux + OTel bridge 下 MDC 里没有 traceId，所以日志格式没写 `%X{traceId}`。
 
 被鉴权挡掉的请求同样计数，且排在鉴权之前——否则「某租户一直拿错 key 打网关」在指标里是隐身的。SCG 自带的 `http_client_requests_seconds` 只有 route 维度，没有租户与厂商，这是自建一条指标的理由。
 

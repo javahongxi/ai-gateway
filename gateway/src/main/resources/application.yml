@@ -164,6 +164,16 @@ management:
   # 运维面单独端口：8088 是对外的业务端口，不该顺带把 /actuator 暴露在同一面上
   server:
     port: 8089
+  tracing:
+    sampling:
+      # 默认 0.1。演示与排障都要每个请求有 traceId，生产按流量调回去
+      probability: 1.0
+    export:
+      # 保持 true。实测：Boot 4 + OTel 下把它设成 false 不是「只关掉导出」——tracer 不再生成，
+      # 连 traceparent 都不往厂商请求上带了，等于把链路传播一起关掉。本地没有 collector 时
+      # 导出会静默失败（实测没有噪音），比丢传播划算。接 Jaeger/Tempo 时给
+      # management.opentelemetry.logging.export.otlp.endpoint 指个地址。
+      enabled: true
   endpoints:
     web:
       exposure:

@@ -57,6 +57,7 @@ public final class StubUpstream implements AutoCloseable {
     private final AtomicReference<String> path = new AtomicReference<>();
     private final AtomicReference<String> authorization = new AtomicReference<>();
     private final AtomicReference<String> tenant = new AtomicReference<>();
+    private final AtomicReference<String> traceparent = new AtomicReference<>();
     private final AtomicReference<String> body = new AtomicReference<>();
     private final AtomicInteger requests = new AtomicInteger();
     private final List<String> paths = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -104,6 +105,11 @@ public final class StubUpstream implements AutoCloseable {
         return tenant.get();
     }
 
+    /** W3C 传播头，用来证明链路真的穿过网关接到了厂商。 */
+    public String traceparent() {
+        return traceparent.get();
+    }
+
     public String body() {
         return body.get();
     }
@@ -134,6 +140,7 @@ public final class StubUpstream implements AutoCloseable {
                     path.set(request.fullPath());
                     authorization.set(request.requestHeaders().get(HttpHeaders.AUTHORIZATION));
                     tenant.set(request.requestHeaders().get("X-Tenant-Id"));
+                    traceparent.set(request.requestHeaders().get("traceparent"));
                     body.set(payload);
                     requests.incrementAndGet();
                     paths.add(request.fullPath());

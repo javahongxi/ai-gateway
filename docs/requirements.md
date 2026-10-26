@@ -25,13 +25,13 @@
 | R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri: forward:...` 引到备用路由 | 已实现，见决策 D6 |
 | R7 | 鉴权与租户隔离 | 无 key、错 key、已吊销 key 一律 401；租户身份贯穿日志、指标、限流键 | 自研 `GlobalFilter`，排在路由之前 | 自研 |
 | R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After`，且请求不碰到厂商 | 租户走 `RequestRateLimiter` + 自定义 `KeyResolver`；厂商走自研 `ProviderQuotaFilter` | 已实现，见决策 D5 |
-| R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标；运维面不与业务端口共用 | 自建 `ai.gateway.requests` Timer + actuator 单独端口 | 已实现；traceId 与 TTFT 未做 |
+| R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标 + 首字延迟；traceId 传到厂商；运维面不与业务端口共用 | 自建 `ai.gateway.requests` 与 `ai.gateway.ttft` Timer + micrometer-tracing/OTel + actuator 单独端口 | 已实现；日志 MDC 是已知缺口，见决策 D8 |
 | R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 已实测，见决策 D4 |
 | R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | `HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 已实现，见决策 D2 |
 
 ## 三、决策
 
-七条现在不定、以后要重写的判断。
+八条现在不定、以后要重写的判断。
 
 ### D1 网关不改写报文
 
@@ -128,6 +128,22 @@ String→Predicate 的转换器，配置里只能写 `#{...}` 去引用一个 Ja
   明明写了这句，连打 40 次之后第 34 次还是吃了 429。不测限流的类因此统一 `@Import` 一个
   `AlwaysAllowRateLimiter`（`@Primary` 的 `RateLimiter`），而不是假装能清空配置。
 
+### D8 traceId 传播是通的，日志 MDC 不是
+
+`spring-boot-starter-opentelemetry` 加上之后，实测三件事：
+
+- **厂商收得到 `traceparent`。** SCG 的 `ObservedRequestHttpHeadersFilter` 在发请求前把 W3C 头注进去，桩侧断言格式为 `00-<32hex>-<16hex>-<flags>`。这才是排障真正需要的东西：厂商侧日志能用同一个 id 对上。
+- **`management.tracing.export.enabled=false` 不是「只关导出」。** 设成 false 之后 tracer 不再产生，连 `traceparent` 都不注了——传播和导出是一套开关。所以生产配置保持 true；本地没有 collector 时导出静默失败，实测没有噪音。
+- **WebFlux + OTel bridge 下 MDC 里没有 traceId。** 请求执行中抓 `MDC.get("traceId")` 是 null，`Tracer.currentTraceContext()` 与 `ObservationRegistry.getCurrentObservation()` 也都是 null——reactive 没有线程绑定的 scope。所以日志格式里写 `%X{traceId}` 只会打出空括号，这句已从 `application.yml` 去掉。要修：加 OTel 的 logback-mdc instrumentation，或者从 Reactor Context 里取 span 自己写日志。这条以「已知缺口」的形式钉在 `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，修好了把断言反过来写，别删。
+
+### 首字延迟挂在响应装饰器上
+
+`ai.gateway.ttft` 记的是「进入网关 → 第一个字节交给客户端」。挂点是 `NettyWriteResponseFilter`：它走 `exchange.getResponse().writeAndFlushWith(...)`（流式）或 `writeWith(...)`，所以只要排在它之前（order `-2`）把 response 换成 `ServerHttpResponseDecorator`，就能在字节真正交给客户端那一刻记时。这是**客户端看到的**首字节，不是厂商返回的首字节。
+
+只观察不改字节，与 D1 不冲突。两个配套决定：非 2xx 的响应不记样本（401/429/504 写出去的是错误正文，混进分位数会把指标拖歪）；一个字节都没交出去时也不记。
+
+真机对照（一次 `max_tokens=200` 的流式回答）：`ai_gateway_ttft_seconds_sum` 1.454 秒，`ai_gateway_requests_seconds_sum` 2.057 秒。只看后者会把「多久开始吐字」和「一共吐了多久」混成一个数。
+
 ## 四、配置
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
@@ -182,7 +198,6 @@ spring:
 
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
-| `spring-boot-starter-opentelemetry` | R9 的 traceId | 指标已有，链路还没有 |
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
 
 先前这一节写过「单机限流可以用 `Bucket4jRateLimiter`，只要显式加 `com.bucket4j:bucket4j_jdk17-core`」——不准，划掉：`Bucket4jRateLimiter` 的装配条件是容器里已有 `AsyncProxyManager<String>` bean（`GatewayAutoConfiguration.Bucket4jConfiguration` 上写着 `@ConditionalOnBean(AsyncProxyManager.class)`），而 bucket4j 的 core 包**不提供**任何本地 async 实现，要再引一个集成件（Caffeine / Redisson 那一类）。单机想省 Redis 的话，与其多拉一个依赖，不如像决策 D5 那样自己写一次 `INCR`。
@@ -210,6 +225,10 @@ spring:
 | 没人认领的模型名是 404，不是随便塞给某家 | `ModelRoutingTest#aModelNobodyClaimsIsNotFoundRatherThanSentSomewhere`：`glm-4-plus` → 404，上游请求数 0 |
 | 5:5 灰度真的两边分流量，且与读正文的谓词共存 | `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup`：40 次两边各 >5 次 |
 | 没有 JSON 正文的请求不会卡在谓词上 | `ModelRoutingTest#requestWithoutAJsonBodyDoesNotHangOnThePredicate` |
+| traceId 传到厂商 | `ObservabilityTest#traceIdReachesTheProviderAsATraceparentHeader`：桩收到 `00-<32hex>-<16hex>-<flags>`；关掉导出这条就红 |
+| 首字延迟与整条请求是两个数 | `ObservabilityTest#firstTokenIsRecordedApartFromTheWholeStream`：桩 7 块 × 80ms，TTFT 样本明显小于总耗时样本 |
+| 被拒的请求不贡献首字样本 | `ObservabilityTest#aRejectedRequestContributesNoFirstTokenSample` |
+| 日志 MDC 里没有 traceId（已知缺口） | `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，见决策 D8 |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
 | 厂商开始流式之后卡住，看门狗在空闲预算内切断 | `UpstreamIdleTimeoutTest#stalledStreamIsAbortedByIdleTimeout`：看门狗 400ms、响应头预算 5s，切断落在 350–2500ms 之间。与上一条是一对——同一个场景在关掉看门狗时 1.5 秒仍未结束 |
 | 看门狗不误伤持续吐字的长流 | `UpstreamIdleTimeoutTest#steadyStreamIsNotAffectedByIdleTimeout`：总时长 560ms 超过 400ms 预算，但间隔只有 80ms，完整收完 |
@@ -241,7 +260,7 @@ spring:
 | 期 | 内容 | 完成标志 | 状态 |
 |---|---|---|---|
 | 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
-| 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成；traceId 与 TTFT 留给 R9 的下一段 |
+| 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成（traceId 传播 + TTFT 见 D8；日志 MDC 是记录的缺口） |
 | 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 已完成（两维限流 + 改道，边界见 D5/D6） |
 | 四 | R3 模型路由与灰度 | 按 `model` 分流，权重切换不产生半处理连接 | 已完成（含真机验证），见 D7 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |

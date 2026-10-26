@@ -34,7 +34,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         // 测试不连配置中心：路由与租户全部由下面的 DynamicPropertySource 与本 properties 给出
-        "spring.config.import=",
+        // 每个测试类一句自己的标记：Spring 的上下文缓存键只看合并后的配置，
+        // 不看 @DynamicPropertySource 贡献的值——两个类的光看注解会算同一个上下文，
+        // 路由表就被前一个类复用了（实测整类跑时指标断言会飘）。
+        "ai-gateway.test-context=chat-flow",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
@@ -239,12 +242,32 @@ class GatewayChatFlowTest {
         calls.call(CHAT_PATH, "Bearer sk-alpha");
         calls.call(CHAT_PATH, null);
 
+        awaitCount("alpha", "stub", "200", okBefore + 1);
         assertThat(timerCount("alpha", "stub", "200") - okBefore)
                 .as("成功请求按租户 + 厂商 + 状态计数")
                 .isEqualTo(1);
+        awaitCount("anonymous", "stub", "401", rejectedBefore + 1);
         assertThat(timerCount("anonymous", "stub", "401") - rejectedBefore)
                 .as("被鉴权挡掉的请求也要计数，否则「某租户一直拿错 key 打网关」在指标里隐身")
                 .isEqualTo(1);
+    }
+
+    /**
+     * 等到计数长上去为止。指标是在 {@code doFinally} 里记的，而客户端的 {@code block()} 在响应
+     * 提交时就返回——两者没有先后保证，直接读会偶发读到旧值（整类跑时飘过，单跑不复现）。
+     * 指标本来就是最终一致的，测试就该按最终一致读。
+     */
+    private void awaitCount(String tenant, String provider, String status, long atLeast) {
+        long deadline = System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadline && timerCount(tenant, provider, status) < atLeast) {
+            try {
+                Thread.sleep(20);
+            }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     private long timerCount(String tenant, String provider, String status) {
