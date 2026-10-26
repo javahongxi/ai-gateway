@@ -41,6 +41,13 @@
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
 
+        <!-- R8 限流的存储后端：RedisRateLimiter 的桶状态放在 Redis 里，
+             所以多个网关实例共享同一份配额。单机想换成内存桶见 docs/requirements.md 的说明 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

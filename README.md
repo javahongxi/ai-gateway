@@ -73,13 +73,37 @@ ai_gateway_requests_seconds_count{application="gateway",provider="dashscope",rou
 
 上游流中途卡住由 `ai-gateway.upstream.idle-timeout` 兜（默认 60s）：路由 metadata 的 `response-timeout` 只管「等响应头」，正文阶段没有超时，见 `docs/requirements.md` 决策 D2。
 
+## 限流
+
+两个维度，配额都在 `ai-gateway.rate-limit.*`：
+
+| 维度 | 桶 | 键 | 挡什么 |
+|---|---|---|---|
+| 租户 | `RequestRateLimiter` + Redis 令牌桶 | `tenant:<租户>` | 单个调用方打爆网关 |
+| 厂商 | 自研 `ProviderQuotaFilter`，Redis 固定窗口 | `provider:<厂商>` | 所有租户合计把上游账户配额打满 |
+
+被限一律 429 + `Retry-After`，请求不会碰到厂商。厂商维度为什么不用第二个 `RequestRateLimiter`、窗口为什么是 60 秒而不是 1 秒，都写在 `docs/requirements.md` 决策 D5。
+
+```
+curl -si http://127.0.0.1:8088/deepseek/v1/chat/completions \
+  -H "Authorization: Bearer sk-team-a-local-dev" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}' | head -5
+```
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 59
+X-Provider-RateLimit-Limit: 1
+{"error":{"message":"Provider 'deepseek' quota is exhausted, retry shortly.","type":"rate_limit_error","param":null,"code":"provider_rate_limit_exceeded"}}
+```
+
 ## 测试
 
 ```
 mvn -pl gateway test
 ```
 
-12 个用例走进程内桩，不联网：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗（切断卡住的流、不误伤持续吐字的流）。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
+17 个用例走进程内桩与本机 Redis：10 个覆盖鉴权、租户与厂商隔离、两条厂商路由各自的凭证与路径、报文原样、流式逐块、超时语义与指标维度；2 个覆盖空闲看门狗；6 个覆盖限流键与 `Retry-After`；5 个走 Redis 里的真实桶（租户桶、厂商共用桶、状态确实在库里），本机没起 Redis 就整类 skip。真机冒烟在 `ProviderLiveTest`，按每家的环境变量单独开关，缺哪个 skip 哪个：
 
 ```
 mvn -pl gateway test -Dtest=ProviderLiveTest

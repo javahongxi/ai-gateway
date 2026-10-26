@@ -15,6 +15,17 @@ spring:
     gateway:
       server:
         webflux:
+          # R8 租户维度：一个租户一个桶，交给 RequestRateLimiter（它写 X-RateLimit-* 头，
+          # 拒绝语义也是客户端熟悉的那套）。厂商维度在 ProviderQuotaFilter 里自己做——
+          # 同一条路由挂两个 RequestRateLimiter，后一个会把前一个的配额覆盖掉，
+          # 见 docs/requirements.md 决策 D5。
+          default-filters:
+            - name: RequestRateLimiter
+              args:
+                keyResolver: "#{@tenantKeyResolver}"
+                redis-rate-limiter.replenishRate: ${ai-gateway.rate-limit.tenant-replenish-rate}
+                redis-rate-limiter.burstCapacity: ${ai-gateway.rate-limit.tenant-burst-capacity}
+                redis-rate-limiter.requestedTokens: ${ai-gateway.rate-limit.tenant-requested-tokens}
           # 路由表。Nacos 里的 ai-gateway.yaml 覆盖这一段，改完即时生效——
           # spring-cloud-gateway 的 RouteRefreshListener 监听配置刷新事件。
           # 上游凭证用 SetRequestHeader 注入：网关不改写报文，只换 host、归一 path、换 key。
@@ -49,6 +60,16 @@ spring:
 
 # 自定义段用顶层前缀，不挤进 spring.*
 ai-gateway:
+  rate-limit:
+    # 租户维度：一个租户一个桶，防的是单个调用方打爆网关
+    tenant-replenish-rate: 5
+    tenant-burst-capacity: 10
+    # 一次调用扣几个令牌；生产上想按 token 量计价式地扣，就把它调大
+    tenant-requested-tokens: 1
+    # 厂商维度：一个厂商在一个窗口内允许几次，所有租户合计；0 表示关掉这一维。
+    # 窗口按分钟而不是按秒：一次模型调用就要几秒到几十秒，按秒开窗永远撞不到
+    provider-requests-per-window: 20
+    provider-window-seconds: 60
   upstream:
     # R11：上游已经开始回话之后，连续多久没有新字节就断开。路由 metadata 的 response-timeout
     # 只管「等响应头」，管不到流中途（见 docs/requirements.md 决策 D2），所以要有这条。

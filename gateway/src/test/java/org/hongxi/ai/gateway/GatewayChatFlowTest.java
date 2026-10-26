@@ -34,6 +34,8 @@ import static org.assertj.core.api.Assertions.assertThat;
         // 测试不连配置中心：路由与租户全部由下面的 DynamicPropertySource 与本 properties 给出
         "spring.config.import=",
         "spring.cloud.nacos.config.import-check.enabled=false",
+        // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
+        "spring.cloud.gateway.server.webflux.default-filters=",
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了
         // 那份文档自带的 import），本机 Nacos 上没有 ai-gateway.yaml 时 SCA 会打一条 NPE
         // 堆栈。功能不受 optional: 影响，测试里把这条噪音压掉

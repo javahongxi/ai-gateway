@@ -41,11 +41,12 @@ public final class GatewayCalls {
     public Outcome call(String path, String authorization) {
         long started = System.nanoTime();
         AtomicInteger status = new AtomicInteger();
+        HttpHeaders responseHeaders = new HttpHeaders();
         List<String> pieces = new CopyOnWriteArrayList<>();
         List<Long> arrivals = new CopyOnWriteArrayList<>();
         AtomicReference<Throwable> failure = new AtomicReference<>();
         try {
-            body(path, authorization, status)
+            body(path, authorization, status, responseHeaders)
                     .doOnNext(buffer -> {
                         pieces.add(read(buffer));
                         arrivals.add(elapsedSince(started));
@@ -57,16 +58,17 @@ public final class GatewayCalls {
             failure.set(timeoutOrAbort);
         }
         return new Outcome(status.get(), String.join("", pieces), elapsedSince(started), List.copyOf(arrivals),
-                failure.get());
+                failure.get(), HttpHeaders.readOnlyHttpHeaders(responseHeaders));
     }
 
     /** 发一次但不等它结束，用来观察「还挂着的那条流」现在怎么样了。 */
     public LiveCall start(String path, String authorization) {
         AtomicInteger status = new AtomicInteger();
-        return new LiveCall(status, body(path, authorization, status));
+        return new LiveCall(status, body(path, authorization, status, new HttpHeaders()));
     }
 
-    private Flux<DataBuffer> body(String path, String authorization, AtomicInteger status) {
+    private Flux<DataBuffer> body(String path, String authorization, AtomicInteger status,
+            HttpHeaders capturedHeaders) {
         return client.post()
                 .uri(path)
                 .contentType(MediaType.APPLICATION_JSON)
@@ -78,6 +80,7 @@ public final class GatewayCalls {
                 .bodyValue(requestBody)
                 .exchangeToFlux(response -> {
                     status.set(response.statusCode().value());
+                    capturedHeaders.putAll(response.headers().asHttpHeaders());
                     return response.bodyToFlux(DataBuffer.class);
                 });
     }
@@ -112,7 +115,8 @@ public final class GatewayCalls {
     }
 
     /** 一次请求的完整观测结果。 */
-    public record Outcome(int status, String body, long elapsed, List<Long> arrivals, Throwable failure) {
+    public record Outcome(int status, String body, long elapsed, List<Long> arrivals, Throwable failure,
+            HttpHeaders headers) {
     }
 
     /** 一次已经发出的请求，能在它还在跑的时候观察状态码、已到达的分块与到达时刻。 */

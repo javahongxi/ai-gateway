@@ -27,12 +27,93 @@ public class AiGatewayProperties {
     /** 租户名到其属性的映射，键只是给人看的标识。 */
     private Map<String, Tenant> tenants = new LinkedHashMap<>();
 
+    /** 两个维度的配额。 */
+    private RateLimit rateLimit = new RateLimit();
+
     public Map<String, Tenant> getTenants() {
         return tenants;
     }
 
     public void setTenants(Map<String, Tenant> tenants) {
         this.tenants = tenants;
+    }
+
+    public RateLimit getRateLimit() {
+        return rateLimit;
+    }
+
+    public void setRateLimit(RateLimit rateLimit) {
+        this.rateLimit = rateLimit;
+    }
+
+    /**
+     * 限流配额。租户维度交给 spring-cloud-gateway 的 {@code RequestRateLimiter}（它写
+     * {@code X-RateLimit-*} 头），厂商维度由 {@code ProviderQuotaFilter} 自己实现——原因见
+     * docs/requirements.md 的决策 D5：同一条路由上挂两个 RequestRateLimiter，后一个的配额会把
+     * 前一个覆盖掉。
+     */
+    public static class RateLimit {
+
+        /** 租户桶：每秒补几个。 */
+        private int tenantReplenishRate = 5;
+
+        /** 租户桶：能攒几个。 */
+        private int tenantBurstCapacity = 10;
+
+        /** 租户桶：一次调用扣几个令牌。默认 1；把长回答记成几个令牌就调大。 */
+        private int tenantRequestedTokens = 1;
+
+        /**
+         * 厂商桶：一个窗口内允许几次，0 表示关掉这一维。窗口长度是
+         * {@link #providerWindowSeconds}。
+         */
+        private int providerRequestsPerWindow = 20;
+
+        /**
+         * 厂商窗口长度，秒。上游账户配额一般按分钟（RPM）给，而一次模型调用本身就要花几秒到
+         * 几十秒——按秒开窗等于永远撞不到，所以这里默认 60。
+         */
+        private int providerWindowSeconds = 60;
+
+        public int getTenantReplenishRate() {
+            return tenantReplenishRate;
+        }
+
+        public void setTenantReplenishRate(int tenantReplenishRate) {
+            this.tenantReplenishRate = tenantReplenishRate;
+        }
+
+        public int getTenantBurstCapacity() {
+            return tenantBurstCapacity;
+        }
+
+        public void setTenantBurstCapacity(int tenantBurstCapacity) {
+            this.tenantBurstCapacity = tenantBurstCapacity;
+        }
+
+        public int getTenantRequestedTokens() {
+            return tenantRequestedTokens;
+        }
+
+        public void setTenantRequestedTokens(int tenantRequestedTokens) {
+            this.tenantRequestedTokens = tenantRequestedTokens;
+        }
+
+        public int getProviderRequestsPerWindow() {
+            return providerRequestsPerWindow;
+        }
+
+        public void setProviderRequestsPerWindow(int providerRequestsPerWindow) {
+            this.providerRequestsPerWindow = providerRequestsPerWindow;
+        }
+
+        public int getProviderWindowSeconds() {
+            return providerWindowSeconds;
+        }
+
+        public void setProviderWindowSeconds(int providerWindowSeconds) {
+            this.providerWindowSeconds = providerWindowSeconds;
+        }
     }
 
     /** 一个可调用网关的租户。 */

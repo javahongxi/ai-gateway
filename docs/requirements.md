@@ -24,14 +24,14 @@
 | R5 | 失败重试 | 只对尚未开始下发的请求重试；重试不重复计费 | `Retry` 过滤器 | 见决策 D3 |
 | R6 | 熔断与降级 | 厂商错误达阈值后短路，切备用厂商或返回明确降级 | `CircuitBreaker` 过滤器 + `fallbackUri` 引到备用路由 | 依赖缺失 |
 | R7 | 鉴权与租户隔离 | 无 key、错 key、已吊销 key 一律 401；租户身份贯穿日志、指标、限流键 | 自研 `GlobalFilter`，排在路由之前 | 自研 |
-| R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After` | `RequestRateLimiter` + 自定义 `KeyResolver` | 依赖缺失 |
+| R8 | 限流 | 按租户与按厂商两条维度独立限；被限返回 429 带 `Retry-After`，且请求不碰到厂商 | 租户走 `RequestRateLimiter` + 自定义 `KeyResolver`；厂商走自研 `ProviderQuotaFilter` | 已实现，见决策 D5 |
 | R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标；运维面不与业务端口共用 | 自建 `ai.gateway.requests` Timer + actuator 单独端口 | 已实现；traceId 与 TTFT 未做 |
 | R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 已实测，见决策 D4 |
 | R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | `HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 已实现，见决策 D2 |
 
 ## 三、决策
 
-四条现在不定、以后要重写的判断。
+五条现在不定、以后要重写的判断。
 
 ### D1 网关不改写报文
 
@@ -68,6 +68,22 @@ per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 
 实测过程：`AiGatewayProperties` 最初写成 record，Nacos 改 `ai-gateway.tenants.team-a.api-key` 之后日志明确打了 `refresh keys changed: [ai-gateway.tenants.team-a.api-key]`，但网关仍然认旧 key（旧 200、新 401）。改成带 getter/setter 的 JavaBean 之后，同一次改配置在 8 秒内生效，不重启。
 
 这也解释了为什么路由能热更而租户不能：SCG 自己的 `GatewayProperties` 就是 JavaBean。推论：凡是要靠 Nacos 刷新生效的配置段，一律 JavaBean；`@RefreshScope` 不是出路，record 是 final 类，CGLIB 代理不了。
+
+### D5 厂商维度的限流只能自己写
+
+先按直觉做过：一条路由上挂两个 `RequestRateLimiter`，一个按租户一个按厂商，各配各的 `redis-rate-limiter.*`。跑出来两条维度用的是同一份配额。
+
+原因在 `AbstractRateLimiter`：它 `onApplicationEvent(FilterArgsEvent)` 时**不区分这个事件是给谁的**——每个 `RateLimiter` bean 都会收到每条路由上每个 RequestRateLimiter 过滤器的 args，然后按 routeId 写进自己那份 config map。于是同一条路由的第二个过滤器把第一个的配额覆盖掉，两个 bean 都变成 100/100（实测把两个 bean 的 `toString()` 打出来看得清清楚楚）。SCG 5.0.2 里也没有能改 `CONFIGURATION_PROPERTY_NAME` 的构造器，子类化换 property name 这条路也不通。
+
+所以厂商维度改成自研 `ProviderQuotaFilter`：一次 Redis `INCR` + 首次 `EXPIRE`，固定窗口计数，键是 `ai-gateway:provider:{provider}:{窗口序号}`。三点取舍：
+
+- **固定窗口不是令牌桶**。窗口边沿最坏放过两倍量，但这一维要挡的是「持续打爆上游」，不是精确速率；换成令牌桶就得把 `RedisRateLimiter` 那段 Lua 搬过来。
+- **窗口默认 60 秒，不是 1 秒**。这是实测出来的必要性：一次模型调用本身要几秒到几十秒，把窗口设成 1 秒、配额设成 1 连打两次，两次都 200——顺序请求永远落在不同窗口里，限了等于没限。上游账户配额一般也是按分钟给的。
+- **Redis 不可达时放行**。把配额存储的可用性乘进网关的可用性不值当，这一维本来就是软保护。租户维度交给 `RequestRateLimiter`，它挂了是拒绝——两者不一致是有意的。
+
+`Retry-After` 也由这一维自己算（还要等几秒窗口翻篇），`RetryAfterFilter` 只在没人给过的时候兜 1 秒。
+
+顺带一条与 SCG 内置实现的差异：`RedisRateLimiter` 的键是 `request_rate_limiter.{routeId.id}.tokens`，带 routeId；所以同一个 `KeyResolver` 在不同路由上本来就是不同的桶。之前担心的「租户名与厂商名撞桶」在租户/厂商两维之间不会发生（它们在不同路由上也就算了，同一路由上 key 前缀 `tenant:` / `provider:` 仍然保留，是给人看的清楚）。
 
 ## 四、配置
 
@@ -119,15 +135,15 @@ spring:
 
 ## 五、依赖缺口
 
-`gateway/pom.xml` 现在有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR）、`spring-boot-starter-actuator` 与 `micrometer-registry-prometheus`，外加测试依赖。按需求清单还缺：
+`gateway/pom.xml` 现在有 `spring-cloud-starter-gateway-server-webflux`、`spring-cloud-starter-alibaba-nacos-config`、`spring-boot-starter-data-redis`（R8 的桶状态）、`spring-boot-starter-actuator` + `micrometer-registry-prometheus`（R9）、`netty-resolver-dns-native-macos`（macOS 上缺它启动就一直在打 `Unable to load io.netty.resolver.dns.macos...` 的 ERROR），外加测试依赖。按需求清单还缺：
 
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
 | `spring-cloud-starter-circuitbreaker-reactor-resilience4j` | R6 | `SpringCloudCircuitBreakerFilterFactory` 是条件装配，没依赖就没这个过滤器 |
-| `spring-boot-starter-data-redis-reactive` | R8 | `RedisRateLimiter`，跨实例配额才准 |
-| `com.bucket4j:bucket4j_jdk17-core` | R8 | SCG 把它标成 `optional`，用 `Bucket4jRateLimiter` 必须显式加；单机限流可以只要它 |
 | `spring-boot-starter-opentelemetry` | R9 的 traceId | 指标已有，链路还没有 |
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
+
+先前这一节写过「单机限流可以用 `Bucket4jRateLimiter`，只要显式加 `com.bucket4j:bucket4j_jdk17-core`」——不准，划掉：`Bucket4jRateLimiter` 的装配条件是容器里已有 `AsyncProxyManager<String>` bean（`GatewayAutoConfiguration.Bucket4jConfiguration` 上写着 `@ConditionalOnBean(AsyncProxyManager.class)`），而 bucket4j 的 core 包**不提供**任何本地 async 实现，要再引一个集成件（Caffeine / Redisson 那一类）。单机想省 Redis 的话，与其多拉一个依赖，不如像决策 D5 那样自己写一次 `INCR`。
 
 根 pom 原先挂着 `spring-ai-bom` 但没有模块消费，已删：网关走 HTTP 透传，不需要 Spring AI 的模型抽象，留着只会让人以为这条链路依赖它。
 
@@ -148,6 +164,11 @@ spring:
 | 看门狗不误伤持续吐字的长流 | `UpstreamIdleTimeoutTest#steadyStreamIsNotAffectedByIdleTimeout`：总时长 560ms 超过 400ms 预算，但间隔只有 80ms，完整收完 |
 | 指标带 tenant / provider / route / status 四个维度，被拒请求也计数 | `GatewayChatFlowTest#everyCallIsCountedPerTenantAndProviderIncludingRejections`；真机 `/actuator/prometheus` 上能看到 `ai_gateway_requests_seconds_count{provider="dashscope",route="dashscope-chat",status="200",tenant="team-a"}`，401 记成 `tenant="anonymous"` |
 | 改 Nacos 配置不重启即生效（R10） | 手工端到端：往 Nacos 发布 `ai-gateway.yaml` 覆盖租户 key，8 秒内新 key 从 401 变 200、旧 key 反向；record 版配置段做不到这件事，原因见决策 D4 |
+| 租户桶超配额 429，且被限的请求不碰到厂商 | `RedisRateLimitTest#tenantBucketDeniesOnceItsBurstIsGone`：桶 2、每次扣 2，第二次就拒，桩的请求数为 1 |
+| 租户之间各有自己的桶 | `RedisRateLimitTest#anotherTenantKeepsItsOwnBucket`：alpha 打满之后 beta 仍 200 |
+| 厂商桶是所有租户共用的 | `RedisProviderRateLimitTest#providerBucketIsSharedBetweenTenants`：alpha、beta 各一次就把窗口用掉，第三个请求（还是 alpha）429，桩只收到 2 次 |
+| 配额状态在 Redis 里，不在 JVM 里 | `RedisRateLimitTest#bucketStateLivesInRedisNotInTheJvm`：调用后能按 `request_rate_limiter.*tenant:alpha*` 扫到键 |
+| 真机上厂商窗口真的会拒 | 手工：`--ai-gateway.rate-limit.provider-requests-per-window=1` 起网关，连打两次 `/deepseek/v1/chat/completions`，第二次 `429` + `Retry-After: 59` + `X-Provider-RateLimit-Limit: 1` |
 
 运维面与业务面分端口是实测过的：`management.server.port: 8089` 下 `/actuator/prometheus` 返回 200，而 8088 上同一路径返回 404。SCG 自带的指标在 Boot 4 / SCG 5 这套组合里叫 `http_client_requests_seconds`（tag 是 `spring_cloud_gateway_route_id` 等），没有租户维度——这是自建 `ai.gateway.requests` 的理由。
 
@@ -157,6 +178,7 @@ spring:
 
 - **到达次数不能当断言。** 同一次跑里 qwen 分 40 次到达、deepseek 只有 7 次——厂商一次只回一个 token 时整条流就在两三个 TCP 读里走完。「逐块不缓冲」这条性质要用固定 80ms 间隔的桩来钉，真机只验接得上、格式对。
 - **usage 是否带取决于厂商，真机不断言。** 同一份请求直连 DashScope 三次都带 usage，走网关的某一次却没带（5 次里 1 次，之后两次重跑又都带）。冒烟测试断言它等于把厂商的抖动引进 CI，所以这里只打印；扫描规则由上面的形状结论承载，等计量层落地时用桩钉。
+- **限流测试不能让真实时间参与。** 第一版写「桶 2、每秒补 1、第三次被拒」，三次调用本身要跑 0.5~1.8 秒，跨过秒界就补回一枚令牌，第三次反而放行——同一份代码连跑三次能给出两种结果。改成「桶 2、每次扣 2」之后，第二次必然要等两秒才可能放行，而两个本地调用之间只隔几十毫秒，断言就稳了。厂商那一维再加一个固定 `Clock` 注入，窗口键完全钉住。
 
 还剩两条没测，因为它们各自的实现还没写：
 
@@ -171,6 +193,6 @@ spring:
 |---|---|---|---|
 | 一 | R1 + R2 + R7，单厂商，租户 key 来自配置 | OpenAI 兼容客户端把 `base-url` 指向网关后，非流式与流式都通；无 key 返回 401 | 已完成，见上表 |
 | 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成；traceId 与 TTFT 留给 R9 的下一段 |
-| 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 未做 |
+| 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | R8 已完成（两维 + 真机验证）；R6 未做 |
 | 四 | R3 模型路由与灰度 | 按 `$.model` 分流，权重切换不产生半处理连接 | 未做 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |
