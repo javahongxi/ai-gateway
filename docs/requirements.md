@@ -6,7 +6,7 @@
 
 网关只负责把一次模型调用送到该去的厂商，并把响应原样流回来。四件事不在范围内：
 
-- 计费与配额结算。网关留下取用量的钩子和埋点，不落库、不出账。
+- 计费与结算。网关**采集**用量（R12：prompt / completion / cached / reasoning tokens，进指标与请求日志），但不**结算**——不落库、不扣费、不管倍率、不做充值与出账。这一条原先写成"计费与配额结算"一整块，把采集也顺带划走了，跟 R8 那句"生产上想按 token 量计价式地扣，就把它调大"自相矛盾：按量扣的前提是先有量。故拆成"计量在内、结算在外"。
 - 语义缓存与对话缓存。需要向量检索，属另一层。
 - 内容安全与敏感词。需要策略库与合规口径。
 - Prompt 编排、Agent、工具调用。属应用层。
@@ -28,6 +28,39 @@
 | R9 | 可观测 | 每个请求产出 `tenant / provider / route / 状态 / 耗时` 指标 + 首字延迟；traceId 传到厂商；运维面不与业务端口共用 | 自建 `ai.gateway.requests` 与 `ai.gateway.ttft` Timer + micrometer-tracing/OTel + actuator 单独端口 | 已实现；日志 MDC 是已知缺口，见决策 D8 |
 | R10 | 配置动态下发 | 改 Nacos 配置后路由、权重、密钥即时生效，不重启不断流 | `RouteRefreshListener` 监听 `RefreshScopeRefreshedEvent` | 已实测，见决策 D4 |
 | R11 | 流中途空闲保护 | 厂商开始流式之后停止吐字，网关在空闲预算内断开，不挂死连接 | `HttpClientCustomizer` 给上游通道加 `ReadTimeoutHandler` | 已实现，见决策 D2 |
+
+### 本批新增（对标 new-api，全部未做）
+
+对标的是 new-api 的**机制**，不是它的范围。支付、卡密、订阅、用户体系、casbin 权限、前端控制台那一整块属"分发平台"，不在本表内；理由与出处见决策后的「对标出处」。
+
+| # | 需求 | 验收标准 | Spring Cloud Gateway 落点 | 状态 |
+|---|---|---|---|---|
+| R12 | 用量计量 | 同一次对话，流式与非流式拿到同一组 `prompt / completion / cached / reasoning` 数；被拒（401/403/429）与首字节前失败的请求不产生 usage；厂商没回 usage 时记成 `unknown` 而不是 0 | 与 TTFT 同一个只读响应装饰器（`order -2`，早于 `NettyWriteResponseFilter`）扫块，取第一个带 `completion_tokens` 的块 | 未做；扫描形状依据见「实测记录」里那条两家 usage 形状差异 |
+| R13 | 请求级结构化日志 | 每个请求产出一行 JSON，含 `tenant / token / route / provider / requested_model / upstream_model / status / 耗时 / ttft / usage / traceId / 上游 request id`；同一 `traceId` 能在日志与 trace 之间对上 | 装饰器 + `TenantAuthFilter` 已备的属性；`traceId` 依赖 D8 那条 MDC 缺口修掉 | 未做 |
+| R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 判定发生在响应侧（只读，不改字节），命中后以 `exchange` 属性通知熔断；熔断配置不变 | 未做；现熔断只认错误率，认不出这一类 |
+| R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `@Scheduled` + `WebClient`，写熔断状态与一个 gauge | 未做 |
+| R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 未做，与 D10 同批 |
+| R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.tenants` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter` | 未做 |
+| R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `@Scheduled` + `WebClient`，与 R15 共用一套探测框架 | 未做 |
+| R19 | 请求侧模型名改写 | 客户端传 `deepseek-v4-flash` 打到 dashscope 路由时，桩收到的是该厂商认的名字；改道到备用厂商后，第二条路由按备用厂商自己的映射再改写一次 | 新增一个请求侧过滤器，跟随最终命中路由的 `metadata.provider` | 未做，见决策 D9 |
+| R20 | 虚拟模型名与升档重试 | 一个对外名字（如 `chat-default`）后面挂多家，按优先级选主、失败后重试换档；没人认领的名字仍是 404 而不是随便塞给某家 | provider 声明 + `Model` 谓词 + R19 的改写 | 未做，依赖 D9/D10 |
+| R21 | 跨协议入口（Claude Messages / Gemini 原生格式进） | 同一份对话，三种入口进、同一家厂商出；流式首字延迟不比现在差（用 `ai.gateway.ttft` 对照，不许恶化） | 转换器注册表 + 请求侧改写；响应侧要逐块重组 | 未做，排在 R12–R20 之后，理由见 D9 末段 |
+
+### 对标出处
+
+上面这些行的实现参照来自本机克隆的 `new-api`（路径相对 `/Users/hongxi/github/new-api`，本次逐个点开过存在性与关键符号）。列在这里是为了**将来能回源核对**，不是引经据典：
+
+- 路由与优先级：`model/ability.go`（`group × model → channel` 的纯决策索引表，不含凭据）、`model/channel_cache.go:117` `GetRandomSatisfiedChannel`（按 priority 分档，第 n 次重试取第 n 高档，档内权重随机）、`service/channel_select.go`（逐组耗尽优先级再切组）。→ 本表 R20、决策 D10。
+- 请求侧改写：`relay/helper/model_mapped.go`（模型映射），被 `relay/compatible_handler.go` 在选完渠道之后调用。→ R19、决策 D9。
+- 语义失败与容灾：`service/channel.go`（`ShouldDisableChannel`：状态码映射表 + 关键词 AC 自动机决定 auto_ban）、`controller/channel-test.go`（测活成功 `ShouldEnableChannel` 自动启用）、`controller/system_task_handlers.go`（定时测活走 system task）、`service/channel_affinity.go`（渠道亲和）。→ R14、R15。
+- 用量与计费：`relay/helper/stream_scanner.go:120`（逐行扫 SSE）、`relay/helper/price.go:112`（`cacheRatio`，缓存命中单独计价）、`service/text_quota.go`（预扣与事后结算）。→ R12。我们只要它前三步的形状，不要结算。
+- 令牌治理：`model/token.go:25-27`（`ModelLimitsEnabled` / `ModelLimits` / `AllowIps`）、`middleware/auth.go`（`x-api-key`、query key、IP 校验的落点）。→ R17。
+- 多 key：`model/channel.go:64` `ChannelInfo` 里带 key 池与轮转。→ R16。
+- 上游余额：`controller/channel-billing.go`。→ R18。
+- 跨协议互转：`relay/channel/adapter.go:18` 一个 `Adaptor` 接口（`Convert{OpenAI,Claude,Gemini,Responses,…}Request` + `DoResponse`）、工厂在 `relay/relay_adaptor.go:50`；通用转换抽成了**独立模块** `relaykit/`，里面是 `relayconvert/{request,response}_registry.go` 注册表 + `internal/{oai_chat,claude_messages,gemini_chat,oai_responses}/` 双向转换器 + golden 测试。→ R21。这份组织方式（注册表 + golden，而不是 switch）是它最值得抄的一点。
+- 日志表：`model/log.go:57`（user/token/model/quota/tokens/channel/group/ip/request_id/upstream_request_id）。→ R13 的字段清单照它取，只是我们落日志行不落库。
+
+三块**不抄**的：异步任务型接口（Midjourney / Suno，`relay/mjproxy_handler.go` + `service/task_polling.go` + TaskAdaptor 的 `estimate/submit/complete` 三段式计费）——它要求网关持有任务状态，与本项目的"一次调用一条流"不是一回事；分发运营那一整块（`controller/topup_*.go`、`model/redemption.go`、`model/subscription.go`、`pkg/jsplugin`）；语义缓存与内容安全，它也没在网关层做。
 
 ## 三、决策
 
@@ -91,7 +124,8 @@ per-route metadata 的两个键**只接受毫秒数字**：`getResponseTimeout` 
 `GATEWAY_REQUEST_URL_ATTR` 换成 fallback 路径、`ServerWebExchangeUtils.reset(exchange)` 释放上游连接，
 然后重新走一遍 `DispatcherHandler`。所以 fallback 能被**另一条路由**接住——这就是改道到备用厂商的通路，
 两条真实厂商互为备份的拓扑在 `application.yml` 里。它还会 `enableBodyCaching(routeId)`，请求体因此可重读，
-文档里那条「`ReadBody` 能不能重读」的未测卡点就是这个。
+文档里那条「`ReadBody` 能不能重读」的未测卡点就是这个（原先只由这段代码回答，现在由
+`CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 里那句 body 全等断言钉住）。
 
 四件事必须记下来：
 
@@ -147,6 +181,43 @@ String→Predicate 的转换器，配置里只能写 `#{...}` 去引用一个 Ja
 
 真机对照（一次 `max_tokens=200` 的流式回答）：`ai_gateway_ttft_seconds_sum` 1.454 秒，`ai_gateway_requests_seconds_sum` 2.057 秒。只看后者会把「多久开始吐字」和「一共吐了多久」混成一个数。
 
+### D9 网关不改报文这件事开一个口子：响应侧永远只读，请求侧允许改写 model
+
+`状态：已决定，未实现。`
+
+D1 原先一刀切"不改写报文"，代价是文档里三个卡点都解不开：D6.4 那次真机失败（`qwen3.7-plus` 改道到 DeepSeek，回来一句 `The supported API model names are deepseek-flash, deepseek-v4-pro`）、D7 里"虚拟模型名没做，因为要动报文"、以及 R20 整条。三条是同一个原因，所以现在把口子开到刚好够：
+
+- **响应侧永远只读。** 这是 TTFT 和 R12 能成立的前提——一旦重组响应体，流式首字就被做掉了。
+- **请求侧只改 `model` 一个字段。** 不注入 `stream_options`，不动 messages，不改采样参数。D1 原来那句"需要往请求体注入字段时要求客户端自带"保留——那一类改动是把厂商差异推给业务代码，而 `model` 名映射恰恰是网关存在的理由。
+- 代价说清：一次改写是一次几 KB 的对象重建，发生在请求侧、请求还没开始流，所以不影响首字延迟。这条论证 D7 末段已经写过，不是新论据。
+
+真正的坑是**顺序与归属**，而且它和 D6 那条顺序约束方向相反：
+
+1. 改写必须跟着**最终命中的路由**走。熔断改道会重走一遍 `DispatcherHandler`（D6 已证），所以备用路由自己的改写过滤器会自然生效——不要去主路由上"预测改道后会落到哪家"，那是把拓扑知识塞进过滤器。
+2. 因此过滤器排在 `SetRequestHeader` 附近、读 `metadata.provider`，且**排在 `CircuitBreaker` 之后**：熔断要看原始请求（D6.1），改写要看最终请求。yml 里的过滤器顺序又要人记一遍——这正是 D10 要消灭的东西。
+3. 映射必须**幂等**：目标名字找不到映射时原样透传，不抛错。否则改道后二次生效会把已映射的名字再映射一次，表现是"第二次重试报 unknown model"，比原来那个 400 更难查。
+4. 指标与日志从此有两个维度：`requested_model`（客户端传的，路由按它选）和 `upstream_model`（改写后上线的）。只记后者会让"客户端传的模型没人认领"这类 404 排障对不上，R13 的字段就是从这里来的。
+
+做完必须回填实测、现在还是假设的三件事：①改道重投递时过滤器二次生效的实际行为（幂等假设的验证）；②`Content-Length` 在改写后由 SCG 重算还是沿用旧值（桩上看一眼就行，沿用的话请求会被厂商截断或拒收）；③Weight 灰度组里两条路由映射不同时，同一个 `requested_model` 对应两个 `upstream_model` 是预期还是配置错误——要给个说法，别留给读日志的人猜。
+
+R21（Claude Messages / Gemini 入口）排在它后面，不是因为难，是因为它要撞第二次这个口子：跨协议必须改响应体，那是 D1 的另一个例外，得单独决策，别把两件事捆在一起做。
+
+### D10 路由表从手写 URI 拓扑改成 provider 声明加生成
+
+`状态：已决定，未实现。`
+
+两家厂商现在已经是 6 条路由、两条顺序约束（熔断在前、专名在前）和一堆 `forward:/backup/...` 字符串。四家就是 12 条。问题不在行数，在**fallback 目标是个字符串**：写错的代价是一次"配置看着通、改道打到一个不存在的 route id"的静默失败，而它既不在代码里也不在测试里，只在某个周五晚上。
+
+对标的是 new-api 把路由决策单独做成一张表这件事：`model/ability.go` 是 `group × model → channel` 的纯决策索引，里面不放凭据、不放拓扑；`channels` 表只持有上游事实。我们没有数据库，等价物就是"配置态的 ability 表"——providers 声明 + 生成器。
+
+provider 段至少要说清这些（第四节草稿里已有前三个，其余补上）：`base-url`、`key-ref` 或 `keys[]`（R16）、`path`、`response-timeout` / `connect-timeout`、`model-mapping`（D9 的数据来源）、`backup`（替代手写的 fallbackUri）、`provider-window`（R8 厂商维度）、`health-path`（R15、R18 的探测端点）。生成器的产出就是把 `backup` 拼成 `forward:/backup/{id}/...`。
+
+值得多写这层代码的唯一理由是：**那三条靠人记的顺序约束可以进代码并被单测钉住**。顺序、备份路由不挂熔断、`/backup/` 前缀——配置里的规则是约定，代码里的规则是测试。
+
+两条既有结论必须服从，都是踩过一次换来的：D4——providers 段必须是带 getter/setter 的 JavaBean，record 重绑等于没做；D5——厂商维度配额别试图塞进第二个 `RequestRateLimiter`，`AbstractRateLimiter` 收 `FilterArgsEvent` 时不分来源，会互相覆盖。
+
+待验证卡点：①生成路由与手写路由混排时的匹配顺序（`RouteDefinitionLocator` 的合并次序，逃生舱要排在哪儿得先定）；②Nacos 改 providers 触发重建那一瞬间，正在改道中的在途请求会不会指向一个刚消失的 route id——R10 验过"改 key 即时生效"，没验过"改拓扑时在途请求"，这是两件事；③刷新两次不能把路由翻倍（生成器幂等）。
+
 ## 四、配置
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
@@ -193,7 +264,7 @@ spring:
 
 自定义段用顶层 `ai-gateway` 前缀，不挤进 `spring.*`。`routes` 段走 SCG 原生绑定，`RouteRefreshListener` 已经在监听 `RefreshScopeRefreshedEvent`，Nacos 改配置触发 spring-cloud-context 刷新，路由随之重建，R10 不需要代码。
 
-一期实现的是 `tenants` 加手写 `routes`；上面的 `providers` 段是目标形状，等厂商数量多到路由表手写不动了再引入 `@ConfigurationProperties` 与路由生成，那时密钥池（同一家多把 key 轮转）一并解决。
+一期实现的是 `tenants` 加手写 `routes`。上面的 `providers` 段自 D10 起从"目标形状"升成**本批要落的形状**：两家厂商已经是 6 条路由加两条顺序约束，阈值到了。密钥池（同一家多把 key 轮转，R16）与模型名映射（R19）都在这个段里落地，不再另起一处配置。手写 `routes` 保留为逃生舱，但备份关系不再手写。
 
 ## 五、依赖缺口
 
@@ -202,6 +273,9 @@ spring:
 | 依赖 | 服务的需求 | 说明 |
 |---|---|---|
 | `spring-cloud-starter-alibaba-nacos-discovery` + `spring-cloud-starter-loadbalancer` | 内网私有化模型 | 只有接 vLLM / Ollama 集群才需要，直连公网厂商用不上 `lb://` |
+| OTel 的 logback-mdc instrumentation（artifact 名以 `opentelemetry-instrumentation-logback-mdc` 为准，引之前先确认与 Boot 4 / 现有 OTel 版本匹配的那一个） | R13、补 D8 的 MDC 缺口 | 本批唯一可能新增的依赖。不想引就用第二条路：在过滤器里从 Reactor Context 取 span 自己写日志——零依赖，代价是每次都要记得走那条链。二者选一即可，别两个都做 |
+
+R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判定是响应侧只读装饰器，密钥池与令牌治理是配置与过滤器，探活与余额采集用 SCG 已经带进来的 `WebClient`。这既是取舍也是约束——一旦开始为"计量"引一个 SDK，就离结算那一层不远了，而那是本文明确划出去的边界。
 
 先前这一节写过「单机限流可以用 `Bucket4jRateLimiter`，只要显式加 `com.bucket4j:bucket4j_jdk17-core`」——不准，划掉：`Bucket4jRateLimiter` 的装配条件是容器里已有 `AsyncProxyManager<String>` bean（`GatewayAutoConfiguration.Bucket4jConfiguration` 上写着 `@ConditionalOnBean(AsyncProxyManager.class)`），而 bucket4j 的 core 包**不提供**任何本地 async 实现，要再引一个集成件（Caffeine / Redisson 那一类）。单机想省 Redis 的话，与其多拉一个依赖，不如像决策 D5 那样自己写一次 `INCR`。
 
@@ -220,6 +294,7 @@ spring:
 | 无 key、错 key、越权厂商都在碰到厂商之前被挡下 | `GatewayChatFlowTest` 的 401 / 403 用例，断言桩的请求数为 0 |
 | 两条厂商路由各走自己的路径与 key，租户按 provider 隔离 | `GatewayChatFlowTest#eachProviderRouteCarriesItsOwnPathAndCredential` 与 `#tenantAllowedForOneProviderCannotUseAnotherProvidersRoute` |
 | 主厂商连不上时改道备用厂商，客户端拿到备用的 200 | `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup`：备用厂商收到 1 次、带自己的 key 与 `X-Tenant-Id` |
+| 改道重投递之后请求体逐字节不变 | 同一条用例里的 `upstream.body()` 全等断言（本批补上）。做法上多验了一步：把期望值改成 `REQUEST_BODY + "SENTINEL"` 跑一次，用例确实红并报出 expected/actual，所以这条不是空断言 |
 | 熔断打开后不再敲主厂商 | `CircuitBreakerFailoverTest#breakerOpensAfterAWindowOfFailures` 与 `#openBreakerStillServesTheBackupWithoutWaitingOnThePrimary`：窗口 2、阈值 50%，打开之后那一次只打备用 |
 | 慢的主厂商不该被当成死的 | `CircuitBreakerFailoverTest#slowPrimaryIsNotMistakenForADeadOne`：1.5 秒回响应头，改道次数为 0。去掉 `resilience4j.timelimiter...timeout-duration` 这条就红——默认 1 秒会把每个模型调用判超时 |
 | 5xx / reset / 流中途断这三种改不了道 | `#serverErrorFromALivePrimaryIsNotReplacedByTheBackup`、`#connectionResetAfterTheRequestWasSentStillReturnsThePrimaryFailure`、`#midStreamFailureCannotBeFailedOver`：熔断计数与备用都被敲，客户端仍拿主厂商的结果 |
@@ -256,6 +331,21 @@ spring:
 到这里，二、三期列出的未测项都结掉了：`fallbackUri` 与请求体重读见 D6，`Weight` 与读正文谓词的
 共存见 D7。剩下没做的都是新功能（traceId 与 TTFT、虚拟模型名、语义缓存那一层），不是没验的假设。
 
+其中"请求体重读"那半条要说精确点：它**原先**只是读源码结掉的（熔断过滤器改道前会
+`enableBodyCaching(routeId)`，出处见 D6 那段），断言没写——`deadPrimaryIsServedByTheBackup` 当时只断了
+改道次数、备用厂商的 key 与租户头。现在补上了：那条用例多一句 `upstream.body()` 与请求体的逐字节比对，
+并且用哨兵值验过它真的会红（改成 `REQUEST_BODY + "SENTINEL"` 之后用例失败、报出 expected/actual 两行，
+说明断言在测东西而不是在装饰）。桩侧的取值器本来就有（`StubUpstream#body()`），所以这是一行成本的修补。
+
+这件事值得单独记一笔，是因为它划出一条本项目的验收线：**源码读出来的机制不算结掉，断言才算**。
+补这条不是为了好看——D9 的请求侧改写就落在同一条改道链路上，"改写后的体在二次分发里仍然是那个体"
+是它的前提；前提没钉住就动 D9，将来出问题会分不清是映射写错还是体在重投递时丢了。
+
+补一句免得读串：括号里那几项除语义缓存外都已落地——traceId 传播与 TTFT 见 D8 与 R9，虚拟模型名与
+计量在本批（R19–R21），traceId 唯一没结的是**日志 MDC** 那半条（D8 记为已知缺口，第五节那行
+instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全是未实现状态，实施顺序见第七节
+分期表第六到第九期；上面「等计量层落地时用桩钉」那句里的计量层，现在有了编号，就是 R12。
+
 ## 七、分期
 
 先跑通最小闭环，再补弹性与灰度。
@@ -266,4 +356,10 @@ spring:
 | 二 | R4 超时预算 + R11 空闲保护 + R9 观测 | 504 与流中途断开的边界在指标里看得见 | 已完成（traceId 传播 + TTFT 见 D8；日志 MDC 是记录的缺口） |
 | 三 | R8 限流 + R6 熔断与 failover | 打满配额返回 429；主厂商挂掉自动切备用 | 已完成（两维限流 + 改道，边界见 D5/D6） |
 | 四 | R3 模型路由与灰度 | 按 `model` 分流，权重切换不产生半处理连接 | 已完成（含真机验证），见 D7 |
-| 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | 未做；R10 的租户热更已在二期前测过 |
+| 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
+| 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；真机那条 `qwen3.7-plus` 改道 DeepSeek 的 `unsupported model` 变成 200；三条顺序约束各有单测 | 未做 |
+| 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 未做 |
+| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 未做 |
+| 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
+
+第六期先做而不做第七期，是因为六期的产物是七期的载体：usage 与语义失败都要按 provider 归因，而 provider 这个概念现在散在 metadata、路由 id 和 fallbackUri 三处。顺序反过来会写两遍。
