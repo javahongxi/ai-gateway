@@ -30,7 +30,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 它在失败时把 {@code GATEWAY_REQUEST_URL_ATTR} 换成 fallback 路径、清掉响应状态、
  * {@code ServerWebExchangeUtils.reset(exchange)} 释放上游连接，再走一遍 DispatcherHandler——
  * 所以 fallback 能被<b>另一条路由</b>接住，这就是改道到备用厂商的通路。它同时会
- * {@code enableBodyCaching(routeId)}，请求体因此可重读（文档里那条未测的卡点由这段代码回答）。
+ * {@code enableBodyCaching(routeId)}，请求体因此可重读——这件事先前只由那段代码回答，
+ * 现在由 {@link #deadPrimaryIsServedByTheBackup} 里那条 body 断言钉住。
  *
  * <p>两条实测出来的边界钉在这里：过滤器顺序（见 {@link #route} 的注释）与「响应已经提交之后
  * 改不了道」（{@link #midStreamFailureCannotBeFailedOver}）。
@@ -149,6 +150,10 @@ class CircuitBreakerFailoverTest {
         assertThat(upstream.hits("/upstream/backup")).isEqualTo(1);
         assertThat(upstream.authorization()).as("备用厂商拿到的是它自己的 key").isEqualTo("Bearer backup-secret");
         assertThat(upstream.tenant()).as("租户身份在改道之后仍然带着").isEqualTo("alpha");
+        assertThat(upstream.body())
+                .as("改道重投递之后，备用厂商收到的请求体与客户端发出的一字不差——熔断过滤器那句 "
+                        + "enableBodyCaching(routeId) 从此有断言兜着，不再只是一条源码结论（见 D6）")
+                .isEqualTo(REQUEST_BODY);
     }
 
     @Test
