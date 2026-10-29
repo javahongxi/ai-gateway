@@ -41,7 +41,7 @@
 | R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `ProviderHealthProbe`：`@Scheduled` 入口 + 可直接调的 `probeAll()`，`WebClient` 独立连接 | 已实现，见决策 D13 |
 | R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 已实现，见决策 D14 |
 | R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.Tenant` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter`（读体走 `RequestBodyModels`） | 已实现，见决策 D15 |
-| R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `@Scheduled` + `WebClient`，与 R15 共用一套探测框架 | 未做 |
+| R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `ProviderBalanceProbe`：`@Scheduled` 入口 + 可直调的 `readBalances()`，独立 `WebClient` 绕开过滤器链 | 已实现，见决策 D16 |
 | R19 | 请求侧模型名改写 | 客户端传 `deepseek-v4-flash` 打到 dashscope 路由时，桩收到的是该厂商认的名字；改道到备用厂商后，第二条路由按备用厂商自己的映射再改写一次 | 请求侧过滤器 `ModelMapping`，跟随命中路由点名的 provider（args 没写时读路由 metadata 的 `provider`） | 已实现，见决策 D9 |
 | R20 | 虚拟模型名与升档重试 | 一个对外名字（如 `chat-default`）后面挂多家，按优先级选主、失败后重试换档；没人认领的名字仍是 404 而不是随便塞给某家 | provider 声明 + `Model` 谓词 + R19 的改写 | 未做，依赖 D9/D10 |
 | R21 | 跨协议入口（Claude Messages / Gemini 原生格式进） | 同一份对话，三种入口进、同一家厂商出；流式首字延迟不比现在差（用 `ai.gateway.ttft` 对照，不许恶化） | 转换器注册表 + 请求侧改写；响应侧要逐块重组 | 未做，排在 R12–R20 之后，理由见 D9 末段 |
@@ -298,6 +298,19 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 测试里刻意**不钉轮换的相位**（第三发具体是哪把）：那属于实现细节，钉死它只会让测试跟着抖动。该钉的是"被拒那发用的 key 一定在已用过的两把里"——那才是配额按 key 走的证据。
 
+### D16 余额读取：只报不治，读不到分四种说法，不跟探活共用一个类
+
+`状态：已实现。`
+
+余额是**账户级事实**，不是某次调用的成败。所以本功能三条硬边界：
+
+- **不改任何状态。** 不碰熔断、不动密钥池冷却、不影响选路——"余额快没了"该告警，不该悄悄把一家厂商摘掉；真要"零余额就摘除"，那是路由策略该显式长出来的东西，不该藏在一个读数字的地方。有用例断言读取前后熔断状态、业务样本数、访问日志行数都不变。
+- **读不到就说读不到，而且要说清是哪种读不到。** 端点回 4xx/5xx、字段不存在或不是数、连不上、没凭证——四种各有结果计数（`http-error|missing-field|error`），gauge 一律**保持上一次的值**而不是写 0。"没采到"和"余额为零"是两个完全不同的告警条件；混成一个数，人就会在半夜被叫起来发现只是厂商改了字段名。这条实现上有个附带决定：**没读到过的厂商根本不建这条时间线**（gauge 惰性注册），所以看板上"没有线"和"线在 0"含义不同。
+- **单位进 tag。** 不同厂商的"余额"单位不同（CNY、USD、credits），混在同一个看板上相加是错的；不声明就默认 `credits` 并写明含义。
+- **各家形状交给配置**：`balance-path` + `balance-field`（点号分层）+ 数字字符串也取。没声明 `balance-path` 的厂商一次请求都不发，也不产生 `skipped` 计数——没配的东西不该在看板上占位置。
+
+**为什么不跟 R15 合并成一个探测器**（我原先在 R18 那行写的是"与 R15 共用一套探测框架"，那是不成立的偷懒说法，已在改）：两者成功之后做的事根本不同——探活会收熔断、读余额什么都不做。合成一个类就是给一个布尔开关配两套语义，读的人得先记住开关才能看懂行为。共用的是**约定**而不是代码：独立 `WebClient` 绕开过滤器链、间隔大于初始延迟（一起来就打一轮是白白加压）、`enabled` 只管定时入口而直接调用始终留给测试与运维脚本。真实时间不参与断言这点，两个类都一样。
+
 ### D15 治理判定的方向：宁可锁死，不可放行；读体判断不许改体
 
 `状态：已实现（R17）。`
@@ -405,6 +418,9 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | 改道后请求体还在、模型名换成备用厂商的真名、`Content-Length` 跟着重算 | `#failoverReMapsAgainstTheBackupProviderFromTheOriginalName`；反证（摘掉备份路由的改写会红）见 D9 第一条 |
 | 映射表没命中时逐字节原样透传 | `#modelAbsentFromTheTableIsForwardedByteForByte` |
 | 手写路由优先于生成的兜底路由（逃生舱有效） | `#handwrittenRouteShadowsTheGeneratedFallback`，机制见 D10 卡点① |
+| 余额读取：数字字符串、嵌套路径都取到；读不到分四种说法且 gauge 不写 0 | `ProviderBalanceProbeTest#readsStringNumbersAndNestedPaths`、`#missingFieldIsReportedRatherThanZeroed`、`#httpErrorKeepsThePreviousReading` + 纯函数 2 条（`ProviderBalanceParsingTest`） |
+| 余额读取不改熔断、不进业务指标、不落访问日志 | `#readingBalanceChangesNothingButTheGauge` |
+| 没配 `balance-path` 的厂商零请求；配了但没凭证记 `error` 且不发请求 | `#providersWithoutBalanceConfigAreNeverCalled`、`#credentialsMissingFailsLoudlyWithoutARequest`（各家用独立路径，"零请求"才分得清） |
 | 测试类自带路由表时必须关掉生成器，否则生产的兜底厂商会抢断言 | `ai-gateway.generated-routes=false`，五个测试类各一行，原因见 D10 |
 | 读过请求体就要交回可重放的体，否则厂商侧挂死 | 第一次跑挂 20 秒暴露，机制见 D9 末条 |
 | 三种 usage 形状（非流式、usage 在 finish 块、usage 在多给的 `choices:[]` 块）得到同一组数 | `UsageAndAccessLogTest#allThreeUsageShapesLogTheSameNumbers` + `UsageExtractionTest` 5 条把扫描规则单独钉住 |
@@ -480,7 +496,7 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
 | 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 已完成：R12、R13（D11）、R14（D12）、R15（D13） |
-| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 部分完成：R16（D14）、R17（D15）已落地，只剩 R18 |
+| 八 | R16 密钥池 + R17 令牌治理 + R18 余额读取 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 已完成：R16（D14）、R17（D15）、R18（D16） |
 | 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
 
 第六期先做而不做第七期，是因为六期的产物是七期的载体：usage 与语义失败都要按 provider 归因，而 provider 这个概念现在散在 metadata、路由 id 和 fallbackUri 三处。顺序反过来会写两遍。
