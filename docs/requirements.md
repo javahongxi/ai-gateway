@@ -35,8 +35,8 @@
 
 | # | 需求 | 验收标准 | Spring Cloud Gateway 落点 | 状态 |
 |---|---|---|---|---|
-| R12 | 用量计量 | 同一次对话，流式与非流式拿到同一组 `prompt / completion / cached / reasoning` 数；被拒（401/403/429）与首字节前失败的请求不产生 usage；厂商没回 usage 时记成 `unknown` 而不是 0 | 与 TTFT 同一个只读响应装饰器（`order -2`，早于 `NettyWriteResponseFilter`）扫块，取第一个带 `completion_tokens` 的块 | 未做；扫描形状依据见「实测记录」里那条两家 usage 形状差异 |
-| R13 | 请求级结构化日志 | 每个请求产出一行 JSON，含 `tenant / token / route / provider / requested_model / upstream_model / status / 耗时 / ttft / usage / traceId / 上游 request id`；同一 `traceId` 能在日志与 trace 之间对上 | 装饰器 + `TenantAuthFilter` 已备的属性；`traceId` 依赖 D8 那条 MDC 缺口修掉 | 未做 |
+| R12 | 用量计量 | 同一次对话，流式与非流式拿到同一组 `prompt / completion / cached / reasoning` 数；被拒（401/403/429）与首字节前失败的请求不产生 usage；厂商没回 usage 时记成 `unknown` 而不是 0 | 只读响应装饰器（`order -3`，早于 `NettyWriteResponseFilter` 的 -1）逐块 peek，取第一个带 `completion_tokens` 的块 | 已实现，见决策 D11 |
+| R13 | 请求级结构化日志 | 每个请求产出一行 JSON，含 `tenant / token / route / provider / requested_model / upstream_model / status / 耗时 / ttft / usage / traceId / 上游 request id`；同一 `traceId` 能在日志与 trace 之间对上 | `AccessLogFilter` 一行 JSON；`traceId` 那格只印客户端带来的 `traceparent`（MDC 那半条仍是 D8 的缺口） | 已实现，见决策 D11 |
 | R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 判定发生在响应侧（只读，不改字节），命中后以 `exchange` 属性通知熔断；熔断配置不变 | 未做；现熔断只认错误率，认不出这一类 |
 | R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `@Scheduled` + `WebClient`，写熔断状态与一个 gauge | 未做 |
 | R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 未做，与 D10 同批 |
@@ -231,6 +231,25 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 待验证卡点：①生成路由与手写路由混排时的匹配顺序（`RouteDefinitionLocator` 的合并次序，逃生舱要排在哪儿得先定）；②Nacos 改 providers 触发重建那一瞬间，正在改道中的在途请求会不会指向一个刚消失的 route id——R10 验过"改 key 即时生效"，没验过"改拓扑时在途请求"，这是两件事；③刷新两次不能把路由翻倍（生成器幂等）。
 
+### D11 观测这一层各看各的字节，不做跨过滤器的属性传递
+
+`状态：已实现（R12、R13）。这条是被两次随机红逼出来的，不是设计出来的。`
+
+先说结论：**响应侧的每一个观察者自己装饰一次响应、自己 peek 字节**，观察者之间不传数据。`UsageRecordingFilter`（order -3）产出计数器，`AccessLogFilter`（order -2 之前，同为响应装饰器）自己再扫一遍同一份正文来填日志里的 `usage` 与 `ttftMs`。两处共用同一个 `extract()`，所以扫描规则只有一份——重复的是读字节这个动作，不是判断逻辑。
+
+理由分两层，都是实测：
+
+- **内层写的属性，外层读不到。** 第一版按常规写法做：用量过滤器把采到的 `Usage` 放进 exchange 属性，日志过滤器在 `doFinally` 里读。单跑那条用例是绿的，整包跑就红——而且红得毫无道理：日志行里 `status` 明明白白是 200。原因是这两个过滤器之间隔着 `mutate()`：装饰响应要 `exchange.mutate().response(...).build()`，本类拿到的是 mutate **之前**的那个对象，写进去的属性表与外层读的表不是同一份。`TenantAuthFilter` 的租户属性能被外层看到，恰恰因为它自己不 mutate。**结论：写属性要写在你会读的那个对象上；跨 mutate 的传递不算传递。**
+- **日志行与客户端拿到最后一个字节之间没有 happens-before。** 那一行是在外层过滤器的 `doFinally` 里落的，客户端的响应可以早一点点完成。于是"调用返回后立刻读 appender"这种断言会随机读到空——三个用例同时红过。修法不是加 `sleep`，是**先记下已有行数，调用后等到它变多**（`awaitNewLine`，上限 5 秒）。这不是把测试写松：它断言的是"这一发确实留下一行"，比 `hasSize(1)` 更准。
+
+两条一起指向同一个取舍：多读一遍几 KB 的正文，换掉一条会悄悄失效的跨层通道。真有大正文的量级再说，那是 `Flux` 上的一次 `scan` 而不是重构。
+
+顺手记三条实现层的，都各红过一次：
+
+- `statusCode` 要在**写字节那一刻**记，不能在 `doFinally` 里读。读到的可能是 null，于是所有正常响应都被判成"没发生"，用量全线静默归零。
+- 厂商没回 usage 时记 `absent`（`ai.gateway.usage.samples{outcome=absent}`），日志里是字符串 `unknown`，**不是四个 0**。把"没采到"印成"用了 0"是指标最典型的说谎方式，而真机确实会这样。
+- 扫描规则是"逐块扫，取第一个带 `completion_tokens` 的"，不是"倒数第二个块"。桩里三个场景（非流式、DeepSeek 把 usage 挂在 finish 块、DashScope 在 `[DONE]` 前多给一个 `choices: []` 的块）走同一条规则得到同一组数，这条以前只是文档里的一句话。
+
 ## 四、配置
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
@@ -325,6 +344,11 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | 手写路由优先于生成的兜底路由（逃生舱有效） | `#handwrittenRouteShadowsTheGeneratedFallback`，机制见 D10 卡点① |
 | 测试类自带路由表时必须关掉生成器，否则生产的兜底厂商会抢断言 | `ai-gateway.generated-routes=false`，五个测试类各一行，原因见 D10 |
 | 读过请求体就要交回可重放的体，否则厂商侧挂死 | 第一次跑挂 20 秒暴露，机制见 D9 末条 |
+| 三种 usage 形状（非流式、usage 在 finish 块、usage 在多给的 `choices:[]` 块）得到同一组数 | `UsageAndAccessLogTest#allThreeUsageShapesLogTheSameNumbers` + `UsageExtractionTest` 5 条把扫描规则单独钉住 |
+| 厂商没回 usage 时是 `absent` / 日志里 `unknown`，不是 0 | `#responseWithoutUsageLogsUnknownRatherThanZeros`；被鉴权挡掉的请求同样不产生 usage 且 `upstream.requests()` 为 0（`#rejectedRequestStillLogsOneLineButCarriesNoUsage`） |
+| 访问日志一行带齐 `tenant/route/provider/requestedModel/upstreamModel/status/elapsedMs/ttftMs/usage/traceparent/upstreamRequestId` | `#accessLineCarriesBothModelNamesAndTheUpstreamRequestId`；两个模型名分开是 D9 那条改写的可见性来源 |
+| 内层过滤器写的属性，外层 `doFinally` 读不到（跨 `mutate()`） | 现象是"整包跑红、单跑绿"，机制与取舍见决策 D11 |
+| 日志行落在客户端完成之后，断言必须等它变多而不是数条数 | `awaitNewLine(before)`，见 D11 第二条 |
 | 日志 MDC 里没有 traceId（已知缺口） | `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，见决策 D8 |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
 | 厂商开始流式之后卡住，看门狗在空闲预算内切断 | `UpstreamIdleTimeoutTest#stalledStreamIsAbortedByIdleTimeout`：看门狗 400ms、响应头预算 5s，切断落在 350–2500ms 之间。与上一条是一对——同一个场景在关掉看门狗时 1.5 秒仍未结束 |
@@ -377,7 +401,7 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 四 | R3 模型路由与灰度 | 按 `model` 分流，权重切换不产生半处理连接 | 已完成（含真机验证），见 D7 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
-| 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 未做 |
+| 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 部分完成：R12 与 R13 已落地（机制与两处实测发现见 D11）；R14、R15 未做 |
 | 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 未做 |
 | 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
 
