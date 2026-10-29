@@ -224,10 +224,23 @@ public class AiGatewayProperties {
         private String chatPath;
 
         /**
-         * 上游凭证。配置里写 {@code ${DASHSCOPE_API_KEY}}，绑定时就解析完了——生成器不需要
-         * 知道占位符这件事。
+         * 单把上游凭证。配置里写 {@code ${DASHSCOPE_API_KEY}}，绑定时就解析完了——生成器不需要
+         * 知道占位符这件事。多把 key 时用 {@link #keys}，两者都填以 {@code keys} 为准。
          */
         private String keyRef;
+
+        /**
+         * 密钥池（R16）：同一家厂商的多把上游 key。上游账户配额是按 key 给的，两家租户各自没打满
+         * 自己的额度、合起来把某一把 key 打到 429 时，轮转 + 按 key 分桶的窗口才挡得住。
+         *
+         * <p>选择策略是"跳过冷却中的、其余轮转"，而不是"选最闲的那把"——闲不闲只有上游知道，网关
+         * 拿到的信号只有它回没回 429。全部 key 都在冷却时照样发出去（轮转），因为把流量挡在门外
+         * 换不来上游更快恢复。
+         */
+        private List<String> keys = new ArrayList<>();
+
+        /** 一把 key 被上游判限流后的冷却时长。 */
+        private java.time.Duration keyCooldown = java.time.Duration.ofSeconds(30);
 
         /**
          * 这个厂商认领的模型名通配（对应 {@code Model} 谓词）。为空表示它是兜底厂商，
@@ -268,6 +281,30 @@ public class AiGatewayProperties {
          * 规则（顶层 {@code error} 且无 {@code choices}）。
          */
         private List<String> failureIndicators = new ArrayList<>();
+
+        public List<String> getKeys() {
+            return keys;
+        }
+
+        public void setKeys(List<String> keys) {
+            this.keys = keys;
+        }
+
+        public java.time.Duration getKeyCooldown() {
+            return keyCooldown;
+        }
+
+        public void setKeyCooldown(java.time.Duration keyCooldown) {
+            this.keyCooldown = keyCooldown;
+        }
+
+        /** 生效的密钥池：{@code keys} 非空以它为准，否则退化成单把 key。 */
+        public List<String> effectiveKeys() {
+            if (keys != null && !keys.isEmpty()) {
+                return keys;
+            }
+            return keyRef == null || keyRef.isBlank() ? List.of() : List.of(keyRef);
+        }
 
         public String getBaseUrl() {
             return baseUrl;

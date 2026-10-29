@@ -16,6 +16,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
+import org.hongxi.ai.gateway.routing.UpstreamKeyPool;
 
 /**
  * R8 厂商维度：一个厂商一个桶、所有租户共用，因为上游给的是账户级配额。普通 API 网关没有这一维，
@@ -77,13 +78,26 @@ public class ProviderQuotaFilter implements GlobalFilter, Ordered {
         }
         // 窗口后缀：把当前秒数按 window 秒取整，同一窗口内所有请求落在同一个键上
         long bucket = clock.instant().getEpochSecond() / window;
-        String key = KEY_PREFIX + provider + ":" + bucket;
+        // R16：这家声明了多把 key 时，窗口按 provider:key 分桶。上游配额本来就是按 key 给的，
+        // 只按厂商计会让 A 把额度用光之后把 B 也算成"已用满"。单把 key 时保持原有键形状不变。
+        String scope = provider + keySuffix(exchange, provider);
+        String key = KEY_PREFIX + scope + ":" + bucket;
         // 兜底只包这一次 Redis 调用。写成整条链的 onErrorResume(e -> chain.filter(exchange))
         // 会把下游的正常失败也当成「Redis 挂了」再走一遍链——504 就是这么被吞成 200 空体的。
         return redis.opsForValue().increment(key)
                 .onErrorResume(redisUnavailable -> Mono.<Long>empty())
                 .defaultIfEmpty(NO_DATA)
                 .flatMap(count -> decide(exchange, chain, key, provider, limit, window, count));
+    }
+
+    /** 多 key 厂商返回 {@code :指纹}，其余返回空串（键形状与单 key 时代一致）。 */
+    private String keySuffix(ServerWebExchange exchange, String provider) {
+        AiGatewayProperties.Provider declared = properties.getProviders().get(provider);
+        if (declared == null || declared.effectiveKeys().size() < 2) {
+            return "";
+        }
+        Object fingerprint = exchange.getAttributes().get(UpstreamKeyPool.SELECTED_FINGERPRINT_ATTRIBUTE);
+        return fingerprint == null ? "" : ":" + fingerprint;
     }
 
     private Mono<Void> decide(ServerWebExchange exchange, GatewayFilterChain chain, String key, String provider,

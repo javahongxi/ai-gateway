@@ -52,7 +52,9 @@ public final class StubUpstream implements AutoCloseable {
         /** 200 + OpenAI 兼容错误体（顶层 {@code error}，没有 {@code choices}）：R14 的结构规则。 */
         JSON_200_ERROR_BODY,
         /** 200 + 顶层 {@code code} 自报失败：R14 的 indicator 规则，只在该厂商声明过这个码时才命中。 */
-        JSON_200_TOP_LEVEL_CODE
+        JSON_200_TOP_LEVEL_CODE,
+        /** 429 + OpenAI 兼容限流体：R16 用它验证"被限流的那把 key 单独冷却"。 */
+        TOO_MANY_REQUESTS
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -177,6 +179,7 @@ public final class StubUpstream implements AutoCloseable {
                         case SSE_USAGE_IN_EXTRA_CHUNK -> usageInExtraChunk(response);
                         case JSON_200_ERROR_BODY -> errorBody(response);
                         case JSON_200_TOP_LEVEL_CODE -> topLevelCode(response);
+                        case TOO_MANY_REQUESTS -> tooManyRequests(response);
                         case RESET -> {
                             // 一个字节都不写，直接把 socket 关掉——这才是厂商进程被 kill 的样子。
                             // 之前这里写的是 Mono.error(new IOException(...))，reactor-netty 会替它
@@ -320,6 +323,18 @@ public final class StubUpstream implements AutoCloseable {
     /** 厂商在顶层 code 上自报失败：没有 error 对象，结构规则不会命中。 */
     public static final String TOP_LEVEL_CODE_BODY = "{\"code\":\"Throttling.AllocationQuota\","
             + "\"message\":\"Queue capacity limit exceeded, please retry later\"}";
+
+    /** 厂商按 key 给配额，所以 429 是"这把 key 该让路"最明确的信号。 */
+    public static final String RATE_LIMITED_BODY = "{\"error\":{\"message\":\"Rate limit reached for this key\","
+            + "\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}";
+
+    private Mono<Void> tooManyRequests(HttpServerResponse response) {
+        return response.status(429)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .header(HttpHeaders.RETRY_AFTER, "30")
+                .sendString(Mono.just(RATE_LIMITED_BODY))
+                .then();
+    }
 
     private Mono<Void> errorBody(HttpServerResponse response) {
         return response.status(200)

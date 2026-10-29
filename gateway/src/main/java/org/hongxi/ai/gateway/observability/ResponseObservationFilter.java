@@ -32,6 +32,7 @@ import org.springframework.web.server.ServerWebExchange;
 
 import org.hongxi.ai.gateway.auth.TenantAuthFilter;
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
+import org.hongxi.ai.gateway.routing.UpstreamKeyPool;
 import org.hongxi.ai.gateway.routing.ModelMappingGatewayFilterFactory;
 import org.hongxi.ai.gateway.routing.ModelRoutePredicateFactory;
 
@@ -39,12 +40,12 @@ import org.hongxi.ai.gateway.routing.ModelRoutePredicateFactory;
  * 响应侧唯一的观察者：把交给客户端的字节<b>只读一遍</b>，然后分三个出口记账——token 用量（R12）、
  * 语义失败（R14）、访问日志一行（R13）。
  *
- * <p><b>为什么是一个观察者三个出口。</b>这三件事读的是同一份正文。分开放曾有两个版本：第一版让日志
- * 从 exchange 属性里读内层过滤器采到的结果，实测是错的——装饰响应要 {@code exchange.mutate()}，
- * 内层写进属性表的值，外层的 {@code doFinally} 读不到（现象是"单跑绿、整包红"，而日志里 status 明明
- * 写着 200；租户那一格能传通，只因为鉴权过滤器自己从不 mutate）。第二版改成各看各的字节，于是两遍
- * 读；R14 是第三个消费者，三遍就说不下去了。所以现在是一份判断逻辑（本类的静态方法）+ 一次读字节，
- * 代价与耦合都最小。见 docs 决策 D11。
+ * <p><b>为什么是一个观察者三个出口。</b>这三件事读的是同一份正文。分开放有过两个失败版本：第一版让
+ * 日志从 exchange 属性里读内层采到的结果，实测读不到——内层在 {@code doFinally} 里写的属性，外层的
+ * {@code doFinally} 看不见（现象是"单跑绿、整包红"，而日志里 status 明明写着 200；同一张表上请求阶段
+ * 写的租户与模型名却一直读得到）。现象被钉在 {@code AttributeVisibilityTest}，成因未验，所以这里只按
+ * 现象写规矩。第二版改成各看各的字节，于是要读两遍；R14 是第三个消费者，三遍说不下去。所以现在是
+ * 一份判断逻辑（本类的静态方法）+ 一次读字节，代价与耦合都最小。见 docs 决策 D11。
  *
  * <p><b>只读，一个字节都不改</b>（决策 D1）：{@link DataBuffer#toString(java.nio.charset.Charset)}
  * 按 position 取数，不推动 readerIndex，peek 完下游拿到的还是完整的一份。累积有上限
@@ -86,11 +87,14 @@ public class ResponseObservationFilter implements GlobalFilter, Ordered {
 
     private final AiGatewayProperties properties;
 
+    private final UpstreamKeyPool keyPool;
+
     public ResponseObservationFilter(MeterRegistry registry, CircuitBreakerRegistry circuitBreakers,
-            AiGatewayProperties properties) {
+            AiGatewayProperties properties, UpstreamKeyPool keyPool) {
         this.registry = registry;
         this.circuitBreakers = circuitBreakers;
         this.properties = properties;
+        this.keyPool = keyPool;
     }
 
     /** 一次调用采到的四个数。整体缺席时压根不产出这个对象，而不是全 0。 */
@@ -173,6 +177,14 @@ public class ResponseObservationFilter implements GlobalFilter, Ordered {
         SemanticFailure semantic = successfulHttp ? detectSemanticFailure(captured, indicatorsOf(provider)) : null;
         if (successfulHttp) {
             account(captured, usage, semantic, tenant, provider);
+        }
+        // 上游回 429，或者 200 里自报限流：把这次用的那把 key 关进冷却（R16）。按 key 而不是按厂商，
+        // 是因为多把 key 时只有被限流的那把该让路——这正是密钥池存在的理由。
+        if (status == 429 || semantic != null) {
+            Object rawKey = exchange.getAttributes().get(UpstreamKeyPool.SELECTED_KEY_ATTRIBUTE);
+            if (rawKey instanceof String key) {
+                keyPool.coolDown(provider, key);
+            }
         }
 
         writeLine(exchange, started, signal, tenant, route, provider, status, firstByteNanos, usage, semantic);
@@ -269,6 +281,12 @@ public class ResponseObservationFilter implements GlobalFilter, Ordered {
         line.put("usage", usage == null ? "unknown" : usageMap(usage));
         if (semantic != null) {
             line.put("semanticFailure", semantic);
+        }
+        // R16：这次用的是哪把 key（只有指纹，原文绝不进日志）。多把 key 时它是排障的第一坐标——
+        // "哪家限流了"不如"哪把 key 限流了"有用
+        Object keyFingerprint = exchange.getAttributes().get(UpstreamKeyPool.SELECTED_FINGERPRINT_ATTRIBUTE);
+        if (keyFingerprint != null) {
+            line.put("upstreamKey", keyFingerprint);
         }
         String traceparent = exchange.getRequest().getHeaders().getFirst("traceparent");
         if (traceparent != null) {

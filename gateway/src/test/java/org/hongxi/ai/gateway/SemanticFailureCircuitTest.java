@@ -158,8 +158,14 @@ class SemanticFailureCircuitTest {
     @Test
     void repeatedHitsOpenTheBreakerAndRouteAroundTheProvider() {
         upstream.scenario(StubUpstream.Scenario.JSON_200_ERROR_BODY);
+        // 两发都要等到那一行日志落下再断言：开闸动作与日志同一处、在完成回调里做，
+        // 不等就是拿"客户端已收到响应"去赌"网关已处理完"——整包跑时这个赌会输（实测红过一次）
+        int beforeFirst = accessLogs.list.size();
         calls.call(CHAT_PATH, "Bearer sk-alpha");
+        awaitNewLine(beforeFirst);
+        int beforeSecond = accessLogs.list.size();
         calls.call(CHAT_PATH, "Bearer sk-alpha");
+        awaitNewLine(beforeSecond);
 
         assertThat(circuitBreakers.find("flaky"))
                 .as("连续两次语义命中就该开闸")
@@ -170,7 +176,9 @@ class SemanticFailureCircuitTest {
 
         // 厂商恢复了：熔断还开着，这一发不该再敲它，而要由备份接走
         upstream.scenario(StubUpstream.Scenario.ECHO_JSON);
+        int beforeThird = accessLogs.list.size();
         Outcome served = calls.call(CHAT_PATH, "Bearer sk-alpha");
+        awaitNewLine(beforeThird);
 
         assertThat(served.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(served.body()).contains("chatcmpl-stub");

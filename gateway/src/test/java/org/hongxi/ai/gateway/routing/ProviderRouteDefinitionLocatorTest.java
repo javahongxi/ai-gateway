@@ -78,13 +78,10 @@ class ProviderRouteDefinitionLocatorTest {
     void circuitBreakerComesBeforeTheRewritesOnPublicRoutes() {
         List<RouteDefinition> routes = twoProviders("dashscope", "deepseek");
 
-        assertThat(filterNames(routes.get(0))).containsExactly("CircuitBreaker", "ModelMapping", "SetPath",
-                "SetRequestHeader");
-        assertThat(filterNames(routes.get(1))).containsExactly("CircuitBreaker", "ModelMapping", "SetPath",
-                "SetRequestHeader");
+        assertThat(filterNames(routes.get(0))).containsExactly("CircuitBreaker", "ProviderKey", "ModelMapping", "SetPath");
+        assertThat(filterNames(routes.get(1))).containsExactly("CircuitBreaker", "ProviderKey", "ModelMapping", "SetPath");
         // 兜底厂商自己的对外路由同样带熔断（它也能改道去 deepseek）
-        assertThat(filterNames(routeById(routes, "dashscope-chat"))).containsExactly("CircuitBreaker", "ModelMapping",
-                "SetPath", "SetRequestHeader");
+        assertThat(filterNames(routeById(routes, "dashscope-chat"))).containsExactly("CircuitBreaker", "ProviderKey", "ModelMapping", "SetPath");
     }
 
     /** 备份路由是最后那道防线：自己不挂熔断，但要照样做名字改写（D9）。 */
@@ -93,7 +90,7 @@ class ProviderRouteDefinitionLocatorTest {
         List<RouteDefinition> routes = twoProviders("dashscope", "deepseek");
 
         RouteDefinition backup = routeById(routes, "backup-dashscope");
-        assertThat(filterNames(backup)).containsExactly("ModelMapping", "SetPath", "SetRequestHeader");
+        assertThat(filterNames(backup)).containsExactly("ProviderKey", "ModelMapping", "SetPath");
         assertThat(backup.getPredicates()).hasSize(1);
         assertThat(backup.getPredicates().get(0).getArgs()).containsValue("/backup/dashscope/v1/chat/completions");
     }
@@ -143,7 +140,7 @@ class ProviderRouteDefinitionLocatorTest {
     void mappingFilterNamesTheProviderItWillUse() {
         List<RouteDefinition> routes = twoProviders("dashscope", "deepseek");
 
-        FilterDefinition mapping = routeById(routes, "backup-deepseek").getFilters().get(0);
+        FilterDefinition mapping = routeById(routes, "backup-deepseek").getFilters().get(1);
         assertThat(mapping.getName()).isEqualTo("ModelMapping");
         // 显式写别名而不是让过滤器去猜：改道后备用路由带的就是备用那个别名，
         // 「跟最终路由走」因此不需要谁去预测改道目标
@@ -156,7 +153,7 @@ class ProviderRouteDefinitionLocatorTest {
         List<RouteDefinition> routes = twoProviders("typo-alias", null);
 
         assertThat(filterNames(routeById(routes, "deepseek-by-model")))
-                .containsExactly("ModelMapping", "SetPath", "SetRequestHeader");
+                .containsExactly("ProviderKey", "ModelMapping", "SetPath");
         assertThat(routes).hasSize(6);
     }
 

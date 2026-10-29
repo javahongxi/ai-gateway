@@ -119,7 +119,7 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
             // 还是主厂商的名字，不在这一步换掉就会撞上「The supported API model names are …」。
             RouteDefinition backup = route("backup-" + alias, provider, alias);
             backup.getPredicates().add(predicate("Path=" + BACKUP_PREFIX + alias + CHAT_ENTRY));
-            backup.setFilters(List.of(mapping(alias), setPath(provider), setKey(provider)));
+            backup.setFilters(List.of(providerKey(alias), mapping(alias), setPath(provider)));
             out.add(backup);
         }
         return out;
@@ -144,15 +144,16 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
         List<FilterDefinition> filters = new ArrayList<>();
         FilterDefinition breaker = circuitBreaker(provider, alias, providers);
         if (breaker != null) {
-            // 顺序有讲究：熔断要排在改路径与换 key 之前。它改道时用的是「自己看到的那个 request」，
-            // 厂商 key 若已在前面被换进去，重投递时鉴权读到的就是厂商 key，直接 401（D6.1 实测踩过）。
+            // 顺序有讲究：熔断要排在改路径、换 key、改写模型名之前。它改道时用的是「自己看到的那个
+            // request」，厂商 key 若已在前面被换进去，重投递时鉴权读到的就是厂商 key，直接 401
+            // （D6.1 实测踩过）。
             filters.add(breaker);
         }
         // 改写在熔断之后：它要按**最终命中**的那条路由的 provider 来定名字。改道会重走一遍分发，
         // 备用路由自己的这一步会用备用厂商的映射，见决策 D9。
+        filters.add(providerKey(alias));
         filters.add(mapping(alias));
         filters.add(setPath(provider));
-        filters.add(setKey(provider));
         return filters;
     }
 
@@ -194,11 +195,15 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
         return definition;
     }
 
-    private FilterDefinition setKey(AiGatewayProperties.Provider provider) {
+    /**
+     * 密钥注入（R16）：多把 key 时"这次用哪把"是每次调用的决定，配置期写不死，所以不再是静态的
+     * {@code SetRequestHeader}。单把 key 也走同一条路——两种写法各跑各的迟早出现"一条被测过、
+     * 另一条没有"的局面。
+     */
+    private FilterDefinition providerKey(String alias) {
         FilterDefinition definition = new FilterDefinition();
-        definition.setName("SetRequestHeader");
-        definition.addArg("name", "Authorization");
-        definition.addArg("value", "Bearer " + provider.getKeyRef());
+        definition.setName("ProviderKey");
+        definition.addArg("provider", alias);
         return definition;
     }
 
