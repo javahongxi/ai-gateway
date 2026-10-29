@@ -40,7 +40,7 @@
 | R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 响应侧只读判定（`ResponseObservationFilter`）；命中后由本类数连续次数并直接 `transitionToOpenState()` | 已实现，见决策 D12 |
 | R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `ProviderHealthProbe`：`@Scheduled` 入口 + 可直接调的 `probeAll()`，`WebClient` 独立连接 | 已实现，见决策 D13 |
 | R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 已实现，见决策 D14 |
-| R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.tenants` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter` | 未做 |
+| R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.Tenant` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter`（读体走 `RequestBodyModels`） | 已实现，见决策 D15 |
 | R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `@Scheduled` + `WebClient`，与 R15 共用一套探测框架 | 未做 |
 | R19 | 请求侧模型名改写 | 客户端传 `deepseek-v4-flash` 打到 dashscope 路由时，桩收到的是该厂商认的名字；改道到备用厂商后，第二条路由按备用厂商自己的映射再改写一次 | 请求侧过滤器 `ModelMapping`，跟随命中路由点名的 provider（args 没写时读路由 metadata 的 `provider`） | 已实现，见决策 D9 |
 | R20 | 虚拟模型名与升档重试 | 一个对外名字（如 `chat-default`）后面挂多家，按优先级选主、失败后重试换档；没人认领的名字仍是 404 而不是随便塞给某家 | provider 声明 + `Model` 谓词 + R19 的改写 | 未做，依赖 D9/D10 |
@@ -298,6 +298,21 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 测试里刻意**不钉轮换的相位**（第三发具体是哪把）：那属于实现细节，钉死它只会让测试跟着抖动。该钉的是"被拒那发用的 key 一定在已用过的两把里"——那才是配额按 key 走的证据。
 
+### D15 治理判定的方向：宁可锁死，不可放行；读体判断不许改体
+
+`状态：已实现（R17）。`
+
+模型白名单、来源地址、令牌到期三件事都放在鉴权层，位置是硬要求——被拒的请求必须一次都不敲厂商，否则配额与密钥的意义就没了。真正需要写下来的是四个方向性选择：
+
+- **解析不了的地址规则按"不匹配"处理并打 WARN。** 反向选择（当"不限制"）会让一个打错的字段把门打开，而这类错误没有症状。IPv6 的 CIDR 段没实现，就明确按不匹配处理，而不是"看不懂就放行"。
+- **白名单非空却读不到模型名时按不允许处理。** 一条畸形请求体就能绕过白名单的话，白名单只是装饰。
+- **默认不信 `X-Forwarded-For`。** 那个头是客户端自己填的；只有前面确实有一台会**覆写**它的代理时，才打开 `trust-forwarded-for` 并取最左值。
+- **白名单为空的租户根本不去读请求体。** 不读就没有"读坏一个字节"的风险，也不用为一个没用到的功能付解析成本。
+
+还有一条与决策 D1 直接相关：**为了看一个字段而重排 JSON，就是改了报文。** 判断要读原始字节、就地解析一份副本，交下去的还是那串原字节（`RequestBodyModels` 把这件事收在一处，`ModelMapping` 也用它）。所以有一条断言专门钉这个：白名单命中之后，桩收到的正文要与客户端发出的**逐字节相同**——字段顺序、空白、中文都不许动。这也是本仓库里唯一一处"网关主动读了请求体、还要保证不改"的地方，值得被单独钉住。
+
+两个踩过的具体点：`cacheRequestBody` 在过滤器这一侧只缓存字节、不换 request（谓词版的 `cacheRequestBodyAndRequest` 才缓存 decorator），读完不交回可重放的请求，厂商就会一直等正文直到超时；以及重放时必须重放**原始字节**——把 Map 再序列化一遍会改字段顺序。
+
 ## 四、配置
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
@@ -396,6 +411,10 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | 厂商没回 usage 时是 `absent` / 日志里 `unknown`，不是 0 | `#responseWithoutUsageLogsUnknownRatherThanZeros`；被鉴权挡掉的请求同样不产生 usage 且 `upstream.requests()` 为 0（`#rejectedRequestStillLogsOneLineButCarriesNoUsage`） |
 | 访问日志一行带齐 `tenant/route/provider/requestedModel/upstreamModel/status/elapsedMs/ttftMs/usage/traceparent/upstreamRequestId` | `#accessLineCarriesBothModelNamesAndTheUpstreamRequestId`；两个模型名分开是 D9 那条改写的可见性来源 |
 | 200 + 错误体原样发给客户端，同时记 `semanticFailure` 与指标 | `SemanticFailureCircuitTest#semanticFailureIsPassedThroughButRecorded`；判定规则另有 8 条单测（`SemanticFailureRulesTest`） |
+| 模型白名单命中后，交给厂商的正文逐字节不变（含中文与字段顺序） | `TokenGovernanceTest#allowedModelReachesTheProviderByteForByte` |
+| 未授权模型、读不到模型名的畸形体 → 403 且桩上请求数为 0 | `#unlistedModelIsRefusedBeforeReachingTheProvider`、`#unparsableBodyCannotSlipPastTheAllowlist` |
+| 来源不在 CIDR 段内 → 403；令牌过期 → 401，与"已吊销"同一形状；没配闸门的租户行为不变 | `#sourceOutsideTheAllowedRangeIsRefused`、`#expiredTokenIsRejectedLikeARevokedOne`、`#tenantsWithoutTheGatesKeepWorking` |
+| 地址规则解析失败按拒绝处理（打错的字段不会把门打开） | `SourceRangesTest#malformedRulesFailClosed`，IPv6 段同样按不匹配处理 |
 | 两把 key 轮转，且被 429 的那把单独让位 | `ProviderKeyRotationTest#consecutiveCallsUseDifferentKeys`、`#throttledKeyCoolsDownAndTheOtherOneKeepsServing` |
 | 厂商窗口按 `provider:key` 分桶：换 key 放行、撞回原 key 才拒 | `ProviderKeyWindowTest#oneKeysQuotaDoesNotExhaustTheOthers`（窗口 1 次 / 600 秒，需本机 Redis） |
 | key 原文绝不进日志，只有末四位指纹 | `#logsCarryTheFingerprintAndNeverTheRawKey` + `UpstreamKeyPoolTest#fingerprintShowsFourCharsAndNeverMore` |
@@ -461,7 +480,7 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
 | 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 已完成：R12、R13（D11）、R14（D12）、R15（D13） |
-| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 部分完成：R16 已落地（见 D14），R17、R18 未做 |
+| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 部分完成：R16（D14）、R17（D15）已落地，只剩 R18 |
 | 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
 
 第六期先做而不做第七期，是因为六期的产物是七期的载体：usage 与语义失败都要按 provider 归因，而 provider 这个概念现在散在 metadata、路由 id 和 fallbackUri 三处。顺序反过来会写两遍。
