@@ -39,7 +39,7 @@
 | R13 | 请求级结构化日志 | 每个请求产出一行 JSON，含 `tenant / token / route / provider / requested_model / upstream_model / status / 耗时 / ttft / usage / traceId / 上游 request id`；同一 `traceId` 能在日志与 trace 之间对上 | `AccessLogFilter` 一行 JSON；`traceId` 那格只印客户端带来的 `traceparent`（MDC 那半条仍是 D8 的缺口） | 已实现，见决策 D11 |
 | R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 响应侧只读判定（`ResponseObservationFilter`）；命中后由本类数连续次数并直接 `transitionToOpenState()` | 已实现，见决策 D12 |
 | R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `ProviderHealthProbe`：`@Scheduled` 入口 + 可直接调的 `probeAll()`，`WebClient` 独立连接 | 已实现，见决策 D13 |
-| R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 未做，与 D10 同批 |
+| R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 已实现，见决策 D14 |
 | R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.tenants` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter` | 未做 |
 | R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `@Scheduled` + `WebClient`，与 R15 共用一套探测框架 | 未做 |
 | R19 | 请求侧模型名改写 | 客户端传 `deepseek-v4-flash` 打到 dashscope 路由时，桩收到的是该厂商认的名字；改道到备用厂商后，第二条路由按备用厂商自己的映射再改写一次 | 请求侧过滤器 `ModelMapping`，跟随命中路由点名的 provider（args 没写时读路由 metadata 的 `provider`） | 已实现，见决策 D9 |
@@ -239,7 +239,8 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 理由分两层，都是实测：
 
-- **内层写的属性，外层读不到。** 第一版按常规写法做：用量过滤器把采到的 `Usage` 放进 exchange 属性，日志过滤器在 `doFinally` 里读。单跑那条用例是绿的，整包跑就红——而且红得毫无道理：日志行里 `status` 明明白白是 200。原因是这两个过滤器之间隔着 `mutate()`：装饰响应要 `exchange.mutate().response(...).build()`，本类拿到的是 mutate **之前**的那个对象，写进去的属性表与外层读的表不是同一份。`TenantAuthFilter` 的租户属性能被外层看到，恰恰因为它自己不 mutate。**结论：写属性要写在你会读的那个对象上；跨 mutate 的传递不算传递。**
+- **内层在 `doFinally` 里写的属性，外层读不到；请求阶段写的能读到。** 第一版按常规写法做：用量过滤器在完成回调里把采到的 `Usage` 放进 exchange 属性，日志层（更外层）在自己的完成回调里读——单跑绿、整包红，而日志里 `status` 明明白白写着 200。同一张属性表上，请求阶段写的东西（`TenantAuthFilter` 的租户、`ModelMapping` 的两个模型名）外层一直读得到。所以差的不是「是不是同一个表」，而是**写的时机**：响应正文是在 `NettyWriteResponseFilter` 里、链的 Mono 完成之后才写出去的，两层的 `doFinally` 不在同一条时间线上，谁先跑没有保证。
+  成因我没有验到那一层（`mutate()` 是否复制属性表、回调顺序由谁决定），所以这里只记现象，并且把它做成探针：`AttributeVisibilityTest#completionPhaseAttributeWrittenByAnInnerFilterIsNotVisibleOutOfIt`。取用的规矩一条：**别指望内层在完成回调里写的属性被外层读到**——要传就在请求阶段传（外层先放一个可变盒子，内层往里装），或者由外层自己算。
 - **日志行与客户端拿到最后一个字节之间没有 happens-before。** 那一行是在外层过滤器的 `doFinally` 里落的，客户端的响应可以早一点点完成。于是"调用返回后立刻读 appender"这种断言会随机读到空——三个用例同时红过。修法不是加 `sleep`，是**先记下已有行数，调用后等到它变多**（`awaitNewLine`，上限 5 秒）。这不是把测试写松：它断言的是"这一发确实留下一行"，比 `hasSize(1)` 更准。
 
 两条一起指向同一个取舍：多读一遍几 KB 的正文，换掉一条会悄悄失效的跨层通道。真有大正文的量级再说，那是 `Flux` 上的一次 `scan` 而不是重构。
@@ -281,6 +282,21 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 - **只探已经被判死的**：`CLOSED` 的厂商一次都不敲（`outcome=already-closed`）。这是本功能全部外部流量的来源，生产默认 30 秒一轮，间隔本身就是配额。
 
 测试写法也记一句：定时那一档在测试里关掉（`ai-gateway.probe.enabled=false`），断言直接调 `probeAll()`——**真实时间不参与断言**，理由与限流用例那条相同。`enabled` 只管定时入口这件事本身另有用例：开关关掉后 `scheduledProbe()` 什么都不做，而 `probeAll()` 照常工作，运维脚本与测试走的是后者。
+
+### D14 密钥池：轮转 + 按 key 分桶 + 单独冷却，日志只落指纹
+
+`状态：已实现。`
+
+上游给的是**按 key** 的账户配额。只按厂商计窗口时，两把 key 会互相顶包：A 把额度用光，B 被算成"已用满"。所以三件事分开做——窗口按 `provider:key` 分桶、被 429 的那把单独冷却、其余继续轮转。
+
+- **注入 key 的活儿从配置期挪到每次调用。** 生成路由里原先是静态的 `SetRequestHeader=Authorization,Bearer xxx`，现在是 `ProviderKey=alias` 过滤器在请求阶段决定用哪把。单把 key 也走这条路——两种写法各跑各的，迟早变成"一条被测过、另一条没有"。老配置（只有 `key-ref`）仍然是合法的一元池，`effectiveKeys()` 负责退化，不搞两套语义。
+- **策略是"跳过冷却中的、其余轮转"**，不是"选最闲的那把"：闲不闲只有上游知道，网关收到的信号只有它回没回 429 / 200 里有没有自报限流。**全部 key 都在冷却时照样发**（记一次 `all-cooling`）——把流量挡在门外换不来上游更快恢复，与厂商限流"Redis 挂了也放行"是同一个判断。
+- **冷却时长可配（`key-cooldown`，默认 30s），设 0 即关闭**。冷却按 key 的指纹而不是原文记账，所以这张表不会因为谁把 key 打印出来就泄漏。
+- **日志与指标只出现末四位指纹**，key 原文存在 exchange 属性里只给冷却登记用（`SELECTED_KEY_ATTRIBUTE`，注释写死"绝不进日志"）。短到四位以内的 key 连指纹都不给——那种"指纹"其实接近原文。
+
+窗口形状向后兼容：只有声明了 **两把以上** key 的厂商才在窗口键上加 `:指纹` 段，单把 key 的键形状与引入本功能之前完全一致（`ProviderKeyWindowTest` 钉的是多 key 那条：三发两桶，第二发换 key 必放行、第三发撞回原 key 必被拒）。
+
+测试里刻意**不钉轮换的相位**（第三发具体是哪把）：那属于实现细节，钉死它只会让测试跟着抖动。该钉的是"被拒那发用的 key 一定在已用过的两把里"——那才是配额按 key 走的证据。
 
 ## 四、配置
 
@@ -380,13 +396,17 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | 厂商没回 usage 时是 `absent` / 日志里 `unknown`，不是 0 | `#responseWithoutUsageLogsUnknownRatherThanZeros`；被鉴权挡掉的请求同样不产生 usage 且 `upstream.requests()` 为 0（`#rejectedRequestStillLogsOneLineButCarriesNoUsage`） |
 | 访问日志一行带齐 `tenant/route/provider/requestedModel/upstreamModel/status/elapsedMs/ttftMs/usage/traceparent/upstreamRequestId` | `#accessLineCarriesBothModelNamesAndTheUpstreamRequestId`；两个模型名分开是 D9 那条改写的可见性来源 |
 | 200 + 错误体原样发给客户端，同时记 `semanticFailure` 与指标 | `SemanticFailureCircuitTest#semanticFailureIsPassedThroughButRecorded`；判定规则另有 8 条单测（`SemanticFailureRulesTest`） |
+| 两把 key 轮转，且被 429 的那把单独让位 | `ProviderKeyRotationTest#consecutiveCallsUseDifferentKeys`、`#throttledKeyCoolsDownAndTheOtherOneKeepsServing` |
+| 厂商窗口按 `provider:key` 分桶：换 key 放行、撞回原 key 才拒 | `ProviderKeyWindowTest#oneKeysQuotaDoesNotExhaustTheOthers`（窗口 1 次 / 600 秒，需本机 Redis） |
+| key 原文绝不进日志，只有末四位指纹 | `#logsCarryTheFingerprintAndNeverTheRawKey` + `UpstreamKeyPoolTest#fingerprintShowsFourCharsAndNeverMore` |
+| 全部 key 都在冷却时照样发；冷却到期后重新可用；旧写法单 `key-ref` 仍是合法池子 | `UpstreamKeyPoolTest`（时钟固定，真实时间不参与断言） |
 | 探到 2xx 就把熔断收闸，且业务样本数与访问日志行数不变 | `ProviderHealthProbeTest#healthyProbeClosesTheBreakerWithoutTouchingBusinessMetrics` |
 | 探到非 2xx 只记指标、不改状态（判死归熔断） | `#unhealthyProbeRecordsButDoesNotChangeState` |
 | 没配 health-path 的厂商跳过且一次请求都不发；`CLOSED` 的厂商不敲 | `#providerWithoutHealthPathIsSkippedWithoutARequest`、`#closedBreakersAreNotProbed` |
 | `probe.enabled` 只管定时入口，直接调用不受影响 | `#enabledSwitchGatesOnlyTheScheduledEntry` |
 | 连续语义命中到阈值即开闸，之后厂商恢复也被绕开 | `#repeatedHitsOpenTheBreakerAndRouteAroundTheProvider`；反证：阈值改成 99 时闸门停在 `CLOSED` |
 | 正常响应不命中，自由文本里的 "quota exceeded" 也不命中 | `SemanticFailureRulesTest#successfulResponsesAreNeverSemanticFailures`、`#choicesWinOverErrorSoPartialFailuresAreNotCounted` |
-| 内层过滤器写的属性，外层 `doFinally` 读不到（跨 `mutate()`） | 现象是"整包跑红、单跑绿"，机制与取舍见决策 D11 |
+| 内层在 `doFinally` 写的属性外层读不到，请求阶段写的可以 | 探针 `AttributeVisibilityTest` 钉住现象（成因未验，只断言可复现的那一半）；取舍见决策 D11 |
 | 日志行落在客户端完成之后，断言必须等它变多而不是数条数 | `awaitNewLine(before)`，见 D11 第二条 |
 | 日志 MDC 里没有 traceId（已知缺口） | `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，见决策 D8 |
 | 真机两家都通，SSE 原样透传、content-type 不改 | `ProviderLiveTest`，按环境变量单独开关：qwen3.7-plus 16–40 次到达、deepseek-v4-flash 7 次到达 |
@@ -441,7 +461,7 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
 | 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 已完成：R12、R13（D11）、R14（D12）、R15（D13） |
-| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 未做 |
+| 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 部分完成：R16 已落地（见 D14），R17、R18 未做 |
 | 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
 
 第六期先做而不做第七期，是因为六期的产物是七期的载体：usage 与语义失败都要按 provider 归因，而 provider 这个概念现在散在 metadata、路由 id 和 fallbackUri 三处。顺序反过来会写两遍。
