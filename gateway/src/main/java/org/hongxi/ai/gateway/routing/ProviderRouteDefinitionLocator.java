@@ -51,6 +51,15 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
     /** 生成的路由排在手写路由之后：见类注释「手写优先，生成兜底」。 */
     static final int GENERATED_ROUTE_ORDER = 1000;
 
+    /**
+     * 模型组的路由比厂商自己的专名路由更具体（认领的是一个确定的虚拟名），所以排在它们前面；
+     * 仍然排在手写路由之后。
+     */
+    static final int MODEL_GROUP_ROUTE_ORDER = 990;
+
+    /** 组内非首跳的内部路径前缀：只被上一跳的改道命中，不是对外入口。 */
+    static final String INTERNAL_PREFIX = "/internal/";
+
     private static final Log log = LogFactory.getLog(ProviderRouteDefinitionLocator.class);
 
     /** 对外的 OpenAI 兼容入口。 */
@@ -76,15 +85,23 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
             // 里 generatedRoutes 的注释：测试类自带路由表，生产是急停闸）
             return Flux.empty();
         }
-        return Flux.fromIterable(build(properties.getProviders()));
+        return Flux.fromIterable(build(properties.getProviders(), properties.getModelGroups()));
     }
 
     /** 包级可见：让单测能直接拿声明算出路由，不必起一个上下文。 */
     List<RouteDefinition> build(Map<String, AiGatewayProperties.Provider> providers) {
+        return build(providers, Map.of());
+    }
+
+    /** 包级可见，同上。第二个参数是模型组（R20），展开成一条改道链。 */
+    List<RouteDefinition> build(Map<String, AiGatewayProperties.Provider> providers,
+            Map<String, List<AiGatewayProperties.ModelGroupEntry>> groups) {
         if (providers == null || providers.isEmpty()) {
             // 没声明 providers 就是不用生成器：测试类们各自注入 routes，这段为空对它们没有影响
             return List.of();
         }
+        List<RouteDefinition> chain = new ArrayList<>();
+        appendGroupRoutes(chain, providers, groups);
         List<RouteDefinition> out = new ArrayList<>();
         // 专名在前、兜底在后：stable sort 保留声明顺序，只把「有 models 的」整体提到前面
         List<Map.Entry<String, AiGatewayProperties.Provider>> ordered = new ArrayList<>(providers.entrySet());
@@ -122,7 +139,96 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
             backup.setFilters(List.of(providerKey(alias), mapping(alias), setPath(provider)));
             out.add(backup);
         }
-        return out;
+        // 模型组更具体（认领一个确定的名字），排在厂商路由前面；order 字段也已经这样设了
+        chain.addAll(out);
+        return chain;
+    }
+
+    /**
+     * 模型组（R20）：一个对外名字挂多家，按顺序改道。
+     *
+     * <p>每跳是一条独立路由：路径（首跳是对外入口，其余是 {@code /internal/} 路径）、{@code Model}
+     * 谓词精确认领这个虚拟名、熔断的 {@code fallbackUri} 指向下一跳，外加<b>这一跳自己的</b>真实
+     * 模型名（写在路由 metadata 的 model-mapping 里，由 D9 那个过滤器应用）。不做成"一次请求里
+     * 重试"，因为响应一旦开始下发就换不了厂商（D6.3），而换档真正的价值在后续请求不再敲已判死的那家。
+     *
+     * <p>某一跳配错（厂商没声明、缺 model）只丢这一跳并打 ERROR：少一个备份是降级，整组消失是
+     * 故障，两者的紧急程度不同。
+     */
+    private void appendGroupRoutes(List<RouteDefinition> out, Map<String, AiGatewayProperties.Provider> providers,
+            Map<String, List<AiGatewayProperties.ModelGroupEntry>> groups) {
+        if (groups == null || groups.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, List<AiGatewayProperties.ModelGroupEntry>> group : groups.entrySet()) {
+            String virtualName = group.getKey();
+            if (!StringUtils.hasText(virtualName) || virtualName.contains("/")
+                    || virtualName.chars().anyMatch(Character::isWhitespace)) {
+                log.error("模型组名 \"" + virtualName + "\" 不合用法（不能含 / 或空白），整组跳过");
+                continue;
+            }
+            List<AiGatewayProperties.ModelGroupEntry> members = usableMembers(virtualName, group.getValue(), providers);
+            for (int index = 0; index < members.size(); index++) {
+                AiGatewayProperties.ModelGroupEntry member = members.get(index);
+                AiGatewayProperties.Provider provider = providers.get(member.getProvider());
+                String path = index == 0 ? CHAT_ENTRY : INTERNAL_PREFIX + virtualName + "/" + index + CHAT_ENTRY;
+                String nextPath = index + 1 < members.size()
+                        ? INTERNAL_PREFIX + virtualName + "/" + (index + 1) + CHAT_ENTRY : null;
+
+                RouteDefinition hop = route("group-" + virtualName + "-" + index + "-" + member.getProvider(),
+                        provider, member.getProvider());
+                hop.setOrder(MODEL_GROUP_ROUTE_ORDER);
+                hop.getPredicates().add(predicate("Path=" + path));
+                hop.getPredicates().add(predicate("Model=" + virtualName));
+                Map<String, Object> metadata = new LinkedHashMap<>(hop.getMetadata());
+                // 这一跳自己的真名：路由属性。同一厂商可能在不同跳上用不同名字，所以不能塞进厂商表
+                metadata.put(ModelMappingGatewayFilterFactory.MODEL_MAPPING_METADATA_KEY,
+                        Map.of(virtualName, member.getModel()));
+                hop.setMetadata(metadata);
+                hop.setFilters(hopFilters(member.getProvider(), provider, nextPath));
+                out.add(hop);
+            }
+        }
+    }
+
+    private List<AiGatewayProperties.ModelGroupEntry> usableMembers(String virtualName,
+            List<AiGatewayProperties.ModelGroupEntry> declared, Map<String, AiGatewayProperties.Provider> providers) {
+        List<AiGatewayProperties.ModelGroupEntry> usable = new ArrayList<>();
+        if (declared == null) {
+            return usable;
+        }
+        for (AiGatewayProperties.ModelGroupEntry member : declared) {
+            if (member == null || !StringUtils.hasText(member.getProvider()) || !StringUtils.hasText(member.getModel())) {
+                log.error("模型组 \"" + virtualName + "\" 里有一跳缺 provider 或 model，丢掉这一跳");
+                continue;
+            }
+            AiGatewayProperties.Provider provider = providers.get(member.getProvider());
+            if (provider == null || !StringUtils.hasText(provider.getBaseUrl())
+                    || !StringUtils.hasText(provider.getChatPath())) {
+                log.error("模型组 \"" + virtualName + "\" 的 " + member.getProvider()
+                        + " 没有声明（或缺 base-url/chat-path），丢掉这一跳");
+                continue;
+            }
+            usable.add(member);
+        }
+        return usable;
+    }
+
+    private List<FilterDefinition> hopFilters(String alias, AiGatewayProperties.Provider provider, String nextPath) {
+        List<FilterDefinition> filters = new ArrayList<>();
+        if (nextPath != null) {
+            FilterDefinition breaker = new FilterDefinition();
+            breaker.setName("CircuitBreaker");
+            breaker.addArg("name", alias);
+            breaker.addArg("fallbackUri", "forward:" + nextPath);
+            breaker.addArg("statusCodes[0]", "INTERNAL_SERVER_ERROR");
+            filters.add(breaker);
+        }
+        // 顺序同 D6.1：熔断在前，密钥注入与模型名改写在后
+        filters.add(providerKey(alias));
+        filters.add(mapping(alias));
+        filters.add(setPath(provider));
+        return filters;
     }
 
     private RouteDefinition route(String id, AiGatewayProperties.Provider provider, String alias) {

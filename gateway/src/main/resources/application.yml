@@ -56,8 +56,8 @@ ai-gateway:
       connect-timeout: 3000
       backup: dashscope
       # D9：客户端传一个名字，各厂商报自己的真名。表里没有的名字原样透传，网关不替厂商编名字。
-      model-mapping:
-        chat-default: deepseek-v4-flash
+      # chat-default 不在这里写——它归下面的 model-groups 拥有，两处都写就是两个事实源。
+      model-mapping: {}
     dashscope:
       base-url: https://dashscope.aliyuncs.com
       # 与对外入口可以不同：DashScope 的 OpenAI 兼容端点多了 /compatible-mode 一段
@@ -68,13 +68,22 @@ ai-gateway:
       connect-timeout: 3000
       backup: deepseek
       health-path: /compatible-mode/v1/models
-      model-mapping:
-        chat-default: qwen3.7-plus
+      model-mapping: {}
       # R14：这家在 HTTP 200 的正文里自报失败时用的顶层错误码。只与顶层 code /
       # error.code / error.type 做等值比较，正文自由文本不参与判定。哪些码算属于部署
       # 事实，这里不替厂商定义；留空就只靠那条与厂商无关的结构规则（顶层有 error 且无
       # choices）。示例形状：failure-indicators: [Throttling.AllocationQuota]
       failure-indicators: []
+
+  # 模型组（R20）：一个对外名字挂多家，顺序就是优先级。前一家连不上或被熔断判死时，请求改道到
+  # 下一跳，而每一跳用的是**自己的**真实模型名（D9 那个改写器在这里发挥作用）。
+  # 它不是"一次请求里重试"：响应一旦开始下发就换不了厂商，换档治的是后续请求（见 D17）。
+  model-groups:
+    chat-default:
+      - provider: deepseek
+        model: deepseek-v4-flash
+      - provider: dashscope
+        model: qwen3.7-plus
 
   # 余额/配额读取（R18）。只读，不改熔断也不改路由；两家厂商没配 balance-path 所以一次都不发。
   # 厂商把余额写成字符串（"3.5"）、嵌在下一层（data.balance）都取；读不到分四种结果计数，

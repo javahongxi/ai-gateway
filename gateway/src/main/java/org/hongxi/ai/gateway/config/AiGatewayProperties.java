@@ -64,6 +64,16 @@ public class AiGatewayProperties {
     /** 余额/配额读取（R18）。 */
     private Balance balance = new Balance();
 
+    /**
+     * 模型组，即虚拟模型名（R20）：一个对外名字后面按顺序挂多家，前一家失败就换后一家，
+     * 每一家拿到的是<b>它自己的</b>真实模型名。
+     *
+     * <p>顺序就是优先级。实现上是"每跳一条路由 + 熔断改道到下一跳"，不是在一次请求里重试：
+     * 响应已经开始下发就换不了厂商（决策 D6.3），而换档真正的价值在于<b>后续请求</b>不再敲已经
+     * 被判死的那家。见 docs 决策 D17。
+     */
+    private Map<String, List<ModelGroupEntry>> modelGroups = new LinkedHashMap<>();
+
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
@@ -105,6 +115,14 @@ public class AiGatewayProperties {
 
     public void setTrustForwardedFor(boolean trustForwardedFor) {
         this.trustForwardedFor = trustForwardedFor;
+    }
+
+    public Map<String, List<ModelGroupEntry>> getModelGroups() {
+        return modelGroups;
+    }
+
+    public void setModelGroups(Map<String, List<ModelGroupEntry>> modelGroups) {
+        this.modelGroups = modelGroups;
     }
 
     public Balance getBalance() {
@@ -527,6 +545,30 @@ public class AiGatewayProperties {
      * 一次外部调用都不发。间隔比探活长得多：余额是按天/按充值周期变的量，秒级读它没有意义，
      * 只是在给厂商加负载。
      */
+    /** 模型组里的一跳：厂商别名 + 这个虚拟名在该厂商的真实模型名。 */
+    public static class ModelGroupEntry {
+
+        private String provider;
+
+        private String model;
+
+        public String getProvider() {
+            return provider;
+        }
+
+        public void setProvider(String provider) {
+            this.provider = provider;
+        }
+
+        public String getModel() {
+            return model;
+        }
+
+        public void setModel(String model) {
+            this.model = model;
+        }
+    }
+
     public static class Balance {
 
         private boolean enabled = true;

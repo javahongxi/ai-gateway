@@ -1,5 +1,6 @@
 package org.hongxi.ai.gateway.routing;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -148,8 +149,17 @@ public class ModelMappingGatewayFilterFactory
         }
     }
 
-    /** provider 从路由 metadata 取；args 里显式写了就以它为准（逃生舱，也是单测的抓手）。 */
+    /**
+     * 取映射表：先看<b>本条路由</b> metadata 上的 {@code model-mapping}，再用该厂商的表。
+     *
+     * <p>这个优先级是 R20 逼出来的：同一个厂商可以在模型组的不同跳上以不同真实名出现，映射因此
+     * 是<b>路由</b>的属性而不是厂商的属性（见 docs 决策 D17）。
+     */
     private Map<String, String> mappingFor(ServerWebExchange exchange, Config config) {
+        Map<String, String> onRoute = routeMapping(exchange);
+        if (!onRoute.isEmpty()) {
+            return onRoute;
+        }
         String provider = StringUtils.hasText(config.getProvider())
                 ? config.getProvider()
                 : providerOf(exchange);
@@ -161,6 +171,21 @@ public class ModelMappingGatewayFilterFactory
             return Map.of();
         }
         return declared.getModelMapping();
+    }
+
+    /** 读路由 metadata 上的映射表；没有就是空表（不猜）。 */
+    private static Map<String, String> routeMapping(ServerWebExchange exchange) {
+        Route route = exchange.getAttribute(ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR);
+        if (route == null || route.getMetadata() == null) {
+            return Map.of();
+        }
+        Object raw = route.getMetadata().get(MODEL_MAPPING_METADATA_KEY);
+        if (!(raw instanceof Map<?, ?> map)) {
+            return Map.of();
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        map.forEach((k, v) -> out.put(String.valueOf(k), v == null ? null : String.valueOf(v)));
+        return out;
     }
 
     private static String providerOf(ServerWebExchange exchange) {
@@ -179,6 +204,9 @@ public class ModelMappingGatewayFilterFactory
 
     /** 改写真正上线后属性里放的键，与 requested 那个成一对（R13 日志要两个字段）。 */
     static final String UPSTREAM_MODEL_KEY = "aiGatewayUpstreamModel";
+
+    /** 路由 metadata 上的映射表键（R20 的模型组用它给每一跳指定自己的真名）。 */
+    public static final String MODEL_MAPPING_METADATA_KEY = "model-mapping";
 
     /** 客户端原本传的模型名（R13 的 requested_model）。 */
     public static String requestedModel(ServerWebExchange exchange) {
