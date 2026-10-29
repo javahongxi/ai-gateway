@@ -43,7 +43,7 @@
 | R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.Tenant` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter`（读体走 `RequestBodyModels`） | 已实现，见决策 D15 |
 | R18 | 上游余额与配额探活 | 定时拉厂商账户接口，产出 `ai_gateway_provider_balance` gauge；拉取失败只打点与一条 warn，**不改变任何路由行为** | `ProviderBalanceProbe`：`@Scheduled` 入口 + 可直调的 `readBalances()`，独立 `WebClient` 绕开过滤器链 | 已实现，见决策 D16 |
 | R19 | 请求侧模型名改写 | 客户端传 `deepseek-v4-flash` 打到 dashscope 路由时，桩收到的是该厂商认的名字；改道到备用厂商后，第二条路由按备用厂商自己的映射再改写一次 | 请求侧过滤器 `ModelMapping`，跟随命中路由点名的 provider（args 没写时读路由 metadata 的 `provider`） | 已实现，见决策 D9 |
-| R20 | 虚拟模型名与升档重试 | 一个对外名字（如 `chat-default`）后面挂多家，按优先级选主、失败后重试换档；没人认领的名字仍是 404 而不是随便塞给某家 | provider 声明 + `Model` 谓词 + R19 的改写 | 未做，依赖 D9/D10 |
+| R20 | 虚拟模型名与升档重试 | 一个对外名字（如 `chat-default`）后面挂多家，按优先级选主、失败后重试换档；没人认领的名字仍是 404 而不是随便塞给某家 | provider 声明 + `Model` 谓词 + R19 的改写 | 已实现，见决策 D17 |
 | R21 | 跨协议入口（Claude Messages / Gemini 原生格式进） | 同一份对话，三种入口进、同一家厂商出；流式首字延迟不比现在差（用 `ai.gateway.ttft` 对照，不许恶化） | 转换器注册表 + 请求侧改写；响应侧要逐块重组 | 未做，排在 R12–R20 之后，理由见 D9 末段 |
 
 ### 对标出处
@@ -326,7 +326,25 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 两个踩过的具体点：`cacheRequestBody` 在过滤器这一侧只缓存字节、不换 request（谓词版的 `cacheRequestBodyAndRequest` 才缓存 decorator），读完不交回可重放的请求，厂商就会一直等正文直到超时；以及重放时必须重放**原始字节**——把 Map 再序列化一遍会改字段顺序。
 
-## 四、配置
+### D17 模型组是"每跳一条路由"，不是一次请求里的重试
+
+`状态：已实现（R20）。`
+
+一个对外名字（如 `chat-default`）后面挂多家、按顺序降级——直觉做法是"失败就重试下一家"。这里刻意没这么做，三条理由：
+
+- **响应一旦开始下发就换不了厂商**（D6.3 已经用三类失败验证过：5xx、reset、流到一半断，都改不了道）。所以"同一次请求里重试"最多只能覆盖首字节之前的失败，覆盖面比看起来小得多。
+- **换档真正的价值在后续请求。** 一家厂商被判死之后，接下来几分钟的流量都不该再敲它——这是熔断本来就在做的事。组只是把"下一跳是谁"表达出来，不复制一套重试逻辑。
+- **SCG 里改道只有一条已验证的通路**：`CircuitBreaker` 的 `fallbackUri` + `forward:` 重走一遍分发（D6 读源码 + 桩验证）。组路由就建在这条通路之上，每跳一个 `fallbackUri` 指向下一跳，最后一跳不挂熔断。新造一套"路由器内重试"等于在已验证的机制旁边再放一个没验证过的。
+
+**每一跳的真实模型名放在路由 metadata 的 `model-mapping` 里，不放厂商表**：同一家厂商可以在不同组、不同跳上以不同真名出现（`chat-default` 在 deepseek 是 `deepseek-v4-flash`，换到 dashscope 是 `qwen3.7-plus`）。`ModelMapping` 因此先看路由再看厂商表——映射是**路由**的属性。这也是 D9 那次改写的自然延续：改道用原始虚拟名做键，所以第二跳换的是第二跳自己的真名，`failoverUsesTheNextHopsOwnModelName` 断的就是这件事（体里既不是 `dead-real` 也不是 `chat-default`）。日志里 `requestedModel` 与 `upstreamModel` 两个字段在跨跳时终于有了实际用处。
+
+**排序与降级**：组路由 `order=990`，比厂商专名（1000）更具体、仍让手写路由（0）优先。某一跳配错（厂商没声明、缺 `model`）只丢这一跳并打 ERROR，不让整条链消失——少一个备份是降级，整组没了是故障，处置紧急度不同。
+
+**虚拟名不会被厂商 glob 抢走**：组的 `Model` 谓词认领的是精确名字且排序在前；反过来，"没人认领的名字"依然 404、零上游请求（`unclaimedModelIsStillNotFound`），组不提供隐式兜底——要兜底就得显式列一跳。
+
+一个测试隔离的教训，跟 D10 那条同源、这次是第二次踩：**只要厂商 `models` 为空就会生成一条兜底路由**，它会把"没人认领该 404"的断言吃掉。所以这个类的测试里每家厂商的 `models` 都指向一个永不匹配的名字。同一个坑还有第二种踩法：另一组测试借用了生产正在用的虚拟名 `chat-default`，结果被生产声明里那个组抢走匹配（组路由更具体），拿到 403——改成测试专用名才对上。**由声明生成配置的模块，测试既要能关掉生成，也要避开生产已经占用的名字。**
+
+
 
 dataId 用 `ai-gateway.yaml`，不用 properties。SCG 的路由是嵌套列表，properties 只能写成 `...routes[0].predicates[0].args.pattern=` 这种带下标的形式，改一次权重要数下标，动态下发就失去意义。属性前缀是 5.x 的 `spring.cloud.gateway.server.webflux.*`。
 
@@ -417,6 +435,9 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | providers 声明真能被 SCG 装配成路由（`Model` 谓词与 `ModelMapping` 过滤器都解析得动） | `GeneratedRoutesAndModelMappingTest` 整类 7 条；真机 `ProviderLiveTest` 跑的也是生成路由 |
 | 改道后请求体还在、模型名换成备用厂商的真名、`Content-Length` 跟着重算 | `#failoverReMapsAgainstTheBackupProviderFromTheOriginalName`；反证（摘掉备份路由的改写会红）见 D9 第一条 |
 | 映射表没命中时逐字节原样透传 | `#modelAbsentFromTheTableIsForwardedByteForByte` |
+| 模型组按顺序改道，且每一跳换成**自己的**真名 | `ModelGroupFailoverTest#failoverUsesTheNextHopsOwnModelName`、`#healthyChainUsesTheFirstHopAndItsName`；结构 5 条在 `ModelGroupRoutesTest` |
+| 首跳被判死后，后续请求不再敲它 | `#openBreakerSkipsTheDeadHopFromTheStart` |
+| 组不提供隐式兜底：没人认领的名字仍 404、零上游请求；内部跳不是对外入口 | `#unclaimedModelIsStillNotFound`、`#internalHopIsNotAPublicEntry` |
 | 手写路由优先于生成的兜底路由（逃生舱有效） | `#handwrittenRouteShadowsTheGeneratedFallback`，机制见 D10 卡点① |
 | 余额读取：数字字符串、嵌套路径都取到；读不到分四种说法且 gauge 不写 0 | `ProviderBalanceProbeTest#readsStringNumbersAndNestedPaths`、`#missingFieldIsReportedRatherThanZeroed`、`#httpErrorKeepsThePreviousReading` + 纯函数 2 条（`ProviderBalanceParsingTest`） |
 | 余额读取不改熔断、不进业务指标、不落访问日志 | `#readingBalanceChangesNothingButTheGauge` |
@@ -497,6 +518,6 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
 | 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 已完成：R12、R13（D11）、R14（D12）、R15（D13） |
 | 八 | R16 密钥池 + R17 令牌治理 + R18 余额读取 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 已完成：R16（D14）、R17（D15）、R18（D16） |
-| 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
+| 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 部分完成：R20 已落地（见 D17）。R21 需要 D1 的第二个例外（响应侧），届时单独成决策 |
 
 第六期先做而不做第七期，是因为六期的产物是七期的载体：usage 与语义失败都要按 provider 归因，而 provider 这个概念现在散在 metadata、路由 id 和 fallbackUri 三处。顺序反过来会写两遍。
