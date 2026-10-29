@@ -54,7 +54,9 @@ public final class StubUpstream implements AutoCloseable {
         /** 200 + 顶层 {@code code} 自报失败：R14 的 indicator 规则，只在该厂商声明过这个码时才命中。 */
         JSON_200_TOP_LEVEL_CODE,
         /** 429 + OpenAI 兼容限流体：R16 用它验证"被限流的那把 key 单独冷却"。 */
-        TOO_MANY_REQUESTS
+        TOO_MANY_REQUESTS,
+        /** 200 + 账户余额体：R18 用它验"取数"，含数字字符串、嵌套路径与单位。 */
+        JSON_200_BALANCE
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -180,6 +182,7 @@ public final class StubUpstream implements AutoCloseable {
                         case JSON_200_ERROR_BODY -> errorBody(response);
                         case JSON_200_TOP_LEVEL_CODE -> topLevelCode(response);
                         case TOO_MANY_REQUESTS -> tooManyRequests(response);
+                        case JSON_200_BALANCE -> balance(response);
                         case RESET -> {
                             // 一个字节都不写，直接把 socket 关掉——这才是厂商进程被 kill 的样子。
                             // 之前这里写的是 Mono.error(new IOException(...))，reactor-netty 会替它
@@ -323,6 +326,21 @@ public final class StubUpstream implements AutoCloseable {
     /** 厂商在顶层 code 上自报失败：没有 error 对象，结构规则不会命中。 */
     public static final String TOP_LEVEL_CODE_BODY = "{\"code\":\"Throttling.AllocationQuota\","
             + "\"message\":\"Queue capacity limit exceeded, please retry later\"}";
+
+    /**
+     * 余额响应的三种情况一次给全：{@code balance} 是<b>字符串</b>数字（厂商常这样写）、
+     * {@code data.remaining} 是嵌套路径、{@code currency} 是单位。字段不存在这一种由另一个厂商的
+     * 配置在同一次调用里覆盖。
+     */
+    public static final String BALANCE_BODY = "{\"balance\":\"3.5\",\"data\":{\"remaining\":12.5},"
+            + "\"currency\":\"CNY\"}";
+
+    private Mono<Void> balance(HttpServerResponse response) {
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .sendString(Mono.just(BALANCE_BODY))
+                .then();
+    }
 
     /** 厂商按 key 给配额，所以 429 是"这把 key 该让路"最明确的信号。 */
     public static final String RATE_LIMITED_BODY = "{\"error\":{\"message\":\"Rate limit reached for this key\","

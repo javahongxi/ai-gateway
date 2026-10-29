@@ -76,6 +76,17 @@ ai-gateway:
       # choices）。示例形状：failure-indicators: [Throttling.AllocationQuota]
       failure-indicators: []
 
+  # 余额/配额读取（R18）。只读，不改熔断也不改路由；两家厂商没配 balance-path 所以一次都不发。
+  # 厂商把余额写成字符串（"3.5"）、嵌在下一层（data.balance）都取；读不到分四种结果计数，
+  # 绝不写成 0——"没采到"与"余额为零"是两个不同的告警条件。
+  # 示例：providers.deepseek.balance-path: /user/balance
+  #       providers.deepseek.balance-field: balance
+  #       providers.deepseek.balance-currency: CNY
+  balance:
+    enabled: true
+    interval: 10m
+    timeout: 5s
+
   # 探活（R15）。只探"已经被熔断判死"且配了 health-path 的厂商，所以这两家之外的一次都不发；
   # 探到 2xx 才收闸，探到非 2xx 只记指标——判死归熔断自己管，这里不抢它的状态机。
   # 探测走独立连接、绕开过滤器链，因此不进业务延迟分位数、不产生 usage、不落访问日志。

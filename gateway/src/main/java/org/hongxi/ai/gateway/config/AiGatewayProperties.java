@@ -61,6 +61,9 @@ public class AiGatewayProperties {
     /** 探活与自动恢复（R15）。 */
     private Probe probe = new Probe();
 
+    /** 余额/配额读取（R18）。 */
+    private Balance balance = new Balance();
+
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
@@ -102,6 +105,14 @@ public class AiGatewayProperties {
 
     public void setTrustForwardedFor(boolean trustForwardedFor) {
         this.trustForwardedFor = trustForwardedFor;
+    }
+
+    public Balance getBalance() {
+        return balance;
+    }
+
+    public void setBalance(Balance balance) {
+        this.balance = balance;
     }
 
     public Probe getProbe() {
@@ -356,6 +367,23 @@ public class AiGatewayProperties {
         private String healthPath;
 
         /**
+         * 余额/配额端点（R18）。各家差异极大，所以路径与取值位置都由配置给出；留空表示不读这家。
+         */
+        private String balancePath;
+
+        /**
+         * 从响应 JSON 里取余额的字段路径，点号分隔，例如 {@code balance} 或 {@code data.balance}。
+         * 厂商常把数字写成字符串（{@code "3.5"}），这种也会取出来。
+         */
+        private String balanceField;
+
+        /**
+         * 余额单位，作为 gauge 的 tag。单位不同的厂商混在同一个看板上读是错的，所以显式写出来；
+         * 默认 {@code credits} 表示"厂商自己的额度单位"。
+         */
+        private String balanceCurrency = "credits";
+
+        /**
          * 这家厂商在 HTTP 200 的正文里自报失败时用的顶层错误码（限流、欠费、审核拒绝那一类）。
          * 只与响应的顶层 {@code code}、{@code error.code}、{@code error.type} 做大小写无关的
          * 等值比较——正文里的自由文本不参与判定。
@@ -445,6 +473,30 @@ public class AiGatewayProperties {
             this.backup = backup;
         }
 
+        public String getBalancePath() {
+            return balancePath;
+        }
+
+        public void setBalancePath(String balancePath) {
+            this.balancePath = balancePath;
+        }
+
+        public String getBalanceField() {
+            return balanceField;
+        }
+
+        public void setBalanceField(String balanceField) {
+            this.balanceField = balanceField;
+        }
+
+        public String getBalanceCurrency() {
+            return balanceCurrency;
+        }
+
+        public void setBalanceCurrency(String balanceCurrency) {
+            this.balanceCurrency = balanceCurrency;
+        }
+
         public String getHealthPath() {
             return healthPath;
         }
@@ -467,6 +519,44 @@ public class AiGatewayProperties {
 
         public void setModelMapping(Map<String, String> modelMapping) {
             this.modelMapping = modelMapping;
+        }
+    }
+
+    /**
+     * 余额读取。默认开着，但只对声明了 {@code balance-path} 的厂商发请求，所以什么都不配时
+     * 一次外部调用都不发。间隔比探活长得多：余额是按天/按充值周期变的量，秒级读它没有意义，
+     * 只是在给厂商加负载。
+     */
+    public static class Balance {
+
+        private boolean enabled = true;
+
+        private java.time.Duration interval = java.time.Duration.ofMinutes(10);
+
+        private java.time.Duration timeout = java.time.Duration.ofSeconds(5);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public java.time.Duration getInterval() {
+            return interval;
+        }
+
+        public void setInterval(java.time.Duration interval) {
+            this.interval = interval;
+        }
+
+        public java.time.Duration getTimeout() {
+            return timeout;
+        }
+
+        public void setTimeout(java.time.Duration timeout) {
+            this.timeout = timeout;
         }
     }
 
