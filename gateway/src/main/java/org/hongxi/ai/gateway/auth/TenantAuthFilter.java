@@ -23,6 +23,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
+import org.hongxi.ai.gateway.routing.RequestBodyModels;
 
 /**
  * 鉴权与租户隔离，排在整条过滤器链最前面：一个没有身份的请求不应该碰到上游厂商，
@@ -78,6 +79,19 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
         }
 
         AiGatewayProperties.Tenant tenant = tenants.get(tenantName);
+
+        // 到期与"未认出/已吊销"同一形状：客户端本来就按 401 处理吊销，不必为过期发明第二套约定
+        if (tenant.expiredAt(java.time.Instant.now())) {
+            return reject(exchange, HttpStatus.UNAUTHORIZED, "invalid_request_error", "api_key_expired",
+                    "The API key expired at %s and is no longer usable.".formatted(tenant.getExpiresAt()));
+        }
+
+        String source = sourceAddress(exchange);
+        if (!tenant.ipAllowed(source)) {
+            return reject(exchange, HttpStatus.FORBIDDEN, "permission_denied_error", "source_ip_not_allowed",
+                    "Tenant '%s' is not allowed to call from '%s'.".formatted(tenantName, source));
+        }
+
         String provider = providerOf(exchange);
         if (provider != null && !tenant.allows(provider)) {
             return reject(exchange, HttpStatus.FORBIDDEN, "permission_denied_error", "provider_not_allowed",
@@ -91,7 +105,23 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
         ServerWebExchange authenticated = exchange.mutate()
                 .request(builder -> builder.headers(headers -> headers.set(TENANT_HEADER, tenantName)))
                 .build();
-        return chain.filter(authenticated);
+
+        // 白名单为空时根本不碰请求体——不读就没有"读坏一个字节"的风险，也省一次解析
+        if (tenant.getAllowedModels() == null || tenant.getAllowedModels().isEmpty()) {
+            return chain.filter(authenticated);
+        }
+        // 模型名要从请求体读：路由匹配阶段的 Model 谓词可能已经解析过（直接复用），否则就地读一次
+        // 并交回可重放的请求体（见 RequestBodyModels 的两个坑）。这一步在碰到厂商之前完成。
+        return RequestBodyModels.resolve(authenticated)
+                .flatMap(resolved -> {
+                    if (tenant.modelAllowed(resolved.model())) {
+                        return chain.filter(resolved.continued());
+                    }
+                    return reject(authenticated, HttpStatus.FORBIDDEN, "permission_denied_error",
+                            "model_not_allowed",
+                            "Tenant '%s' is not allowed to call model '%s'."
+                                    .formatted(tenantName, resolved.model() == null ? "<missing>" : resolved.model()));
+                });
     }
 
     /** {@code Authorization: Bearer xxx} 里的 xxx；大小写不敏感，其它认证方案一律视为无 key。 */
@@ -122,6 +152,28 @@ public class TenantAuthFilter implements GlobalFilter, Ordered {
             }
         }
         return null;
+    }
+
+    /**
+     * 令牌的来源地址。默认用连接上的真实地址：{@code X-Forwarded-For} 是客户端可以自己填的头，
+     * 信它等于让令牌自己挑来源。确实部署在会覆写该头的代理后面时，打开
+     * {@code ai-gateway.trust-forwarded-for}，取最左值。
+     */
+    private String sourceAddress(ServerWebExchange exchange) {
+        if (properties.isTrustForwardedFor()) {
+            String forwarded = exchange.getRequest().getHeaders().getFirst("X-Forwarded-For");
+            if (StringUtils.hasText(forwarded)) {
+                return forwarded.split(",")[0].trim();
+            }
+        }
+        var remote = exchange.getRequest().getRemoteAddress();
+        if (remote == null) {
+            return null;
+        }
+        if (remote.getAddress() != null) {
+            return remote.getAddress().getHostAddress();
+        }
+        return remote.getHostString();
     }
 
     /**

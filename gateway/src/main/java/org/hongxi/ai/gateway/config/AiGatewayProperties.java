@@ -50,6 +50,14 @@ public class AiGatewayProperties {
      */
     private int semanticFailureThreshold = 3;
 
+    /**
+     * 取来源地址时是否采用 {@code X-Forwarded-For} 的最左值（R17）。
+     *
+     * <p>默认 {@code false}：那个头是客户端可以自己填的，信它等于让令牌自己挑自己的来源。只有当
+     * 网关前面确实有一台会<b>覆写</b>该头的代理时才打开。
+     */
+    private boolean trustForwardedFor = false;
+
     /** 探活与自动恢复（R15）。 */
     private Probe probe = new Probe();
 
@@ -86,6 +94,14 @@ public class AiGatewayProperties {
 
     public void setSemanticFailureThreshold(int semanticFailureThreshold) {
         this.semanticFailureThreshold = semanticFailureThreshold;
+    }
+
+    public boolean isTrustForwardedFor() {
+        return trustForwardedFor;
+    }
+
+    public void setTrustForwardedFor(boolean trustForwardedFor) {
+        this.trustForwardedFor = trustForwardedFor;
     }
 
     public Probe getProbe() {
@@ -185,6 +201,28 @@ public class AiGatewayProperties {
          */
         private List<String> providers = new ArrayList<>();
 
+        /**
+         * 允许调用的模型名（R17）。写法与 {@code Model} 谓词一致：{@code *} 前后缀通配，
+         * 例如 {@code qwen*}、{@code deepseek-v4-flash}。为空表示不限模型。
+         *
+         * <p>命中的是<b>客户端传来的名字</b>（改写前的 {@code requested_model}）：白名单是给
+         * 调用方的约定，不是厂商内部名字的清单。
+         */
+        private List<String> allowedModels = new ArrayList<>();
+
+        /**
+         * 允许的来源地址（R17）：CIDR（仅 IPv4 段）或裸地址。为空表示不限来源。
+         * 解析不了的规则按"不匹配"处理并打 WARN——治理类配置宁可锁死，也不能因为一个
+         * 打错的字段把门打开。
+         */
+        private List<String> allowIps = new ArrayList<>();
+
+        /**
+         * 令牌失效时刻（R17），ISO-8601，例如 {@code 2026-12-31T16:00:00Z}。为空表示不过期。
+         * 到期后一律 401，与"未认出/已吊销"同一形状：客户端本来就是这么处理吊销的。
+         */
+        private java.time.Instant expiresAt;
+
         public String getApiKey() {
             return apiKey;
         }
@@ -199,6 +237,51 @@ public class AiGatewayProperties {
 
         public void setProviders(List<String> providers) {
             this.providers = providers;
+        }
+
+        public boolean modelAllowed(String model) {
+            if (allowedModels == null || allowedModels.isEmpty()) {
+                return true;
+            }
+            if (model == null || model.isBlank()) {
+                // 白名单非空却读不到模型名：按不允许处理。放开等于绕过白名单，
+                // 而畸形请求体本来就该被厂商拒绝
+                return false;
+            }
+            return org.springframework.util.PatternMatchUtils.simpleMatch(
+                    allowedModels.toArray(new String[0]), model);
+        }
+
+        public boolean ipAllowed(String remoteAddress) {
+            return org.hongxi.ai.gateway.auth.SourceRanges.allows(allowIps, remoteAddress);
+        }
+
+        public boolean expiredAt(java.time.Instant now) {
+            return expiresAt != null && !now.isBefore(expiresAt);
+        }
+
+        public java.time.Instant getExpiresAt() {
+            return expiresAt;
+        }
+
+        public void setExpiresAt(java.time.Instant expiresAt) {
+            this.expiresAt = expiresAt;
+        }
+
+        public List<String> getAllowedModels() {
+            return allowedModels;
+        }
+
+        public void setAllowedModels(List<String> allowedModels) {
+            this.allowedModels = allowedModels;
+        }
+
+        public List<String> getAllowIps() {
+            return allowIps;
+        }
+
+        public void setAllowIps(List<String> allowIps) {
+            this.allowIps = allowIps;
         }
 
         public boolean allows(String provider) {

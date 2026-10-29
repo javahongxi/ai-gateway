@@ -99,11 +99,19 @@ ai-gateway:
     # 只管「等响应头」，管不到流中途（见 docs/requirements.md 决策 D2），所以要有这条。
     # 它是空闲计时，厂商持续吐 token 时不会触发，长回答不受影响。设 0 关闭。
     idle-timeout: 60s
+  # 取来源地址时是否采用 X-Forwarded-For 的最左值。默认 false：那个头是客户端可以自己填的，
+  # 信它等于让令牌自己挑自己的来源。只有前面确实有一台会覆写该头的代理时才打开。
+  trust-forwarded-for: false
+
   tenants:
     team-a:
       # 本地开发用的网关 key，与厂商 key 无关；上生产由 GATEWAY_TENANT_KEY 覆盖
       api-key: ${GATEWAY_TENANT_KEY:sk-team-a-local-dev}
       providers: [ dashscope, deepseek ]
+      # R17 的三道闸门，留空/不写就等于不限制：
+      # allowed-models: [qwen*, deepseek-v4-flash]   # glob，匹配的是客户端传来的模型名
+      # allow-ips: [10.20.30.0/24, 203.0.113.7]     # CIDR（仅 IPv4 段）或裸地址
+      # expires-at: 2026-12-31T16:00:00Z            # 到点即 401，与"已吊销"同一形状
 
 resilience4j:
   circuitbreaker:

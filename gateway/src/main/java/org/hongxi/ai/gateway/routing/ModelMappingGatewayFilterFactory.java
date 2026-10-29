@@ -6,18 +6,14 @@ import java.util.Map;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
 import org.springframework.cloud.gateway.route.Route;
 import org.springframework.cloud.gateway.support.ServerWebExchangeUtils;
-import org.springframework.core.io.buffer.DataBuffer;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.codec.HttpMessageReader;
 import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.server.HandlerStrategies;
@@ -116,7 +112,7 @@ public class ModelMappingGatewayFilterFactory
      */
     private ServerWebExchange mapName(ServerWebExchange exchange, byte[] body, Map<String, String> mapping) {
         if (body.length == 0) {
-            return serveBody(exchange, body);
+            return RequestBodyModels.replay(exchange, body);
         }
         JsonNode root;
         try {
@@ -124,10 +120,10 @@ public class ModelMappingGatewayFilterFactory
         }
         catch (Exception unparsable) {
             // 不是合法 JSON 就不自作聪明：让厂商去报它该报的错，比网关猜一个形状更可信
-            return serveBody(exchange, body);
+            return RequestBodyModels.replay(exchange, body);
         }
         if (!root.isObject() || !root.path("model").isTextual()) {
-            return serveBody(exchange, body);
+            return RequestBodyModels.replay(exchange, body);
         }
         String inBody = root.path("model").asText();
         // 第一次进来时把客户端原始名字钉住，之后每一轮都用它当键（见类注释）
@@ -140,36 +136,16 @@ public class ModelMappingGatewayFilterFactory
         // 不是"改过才记"
         exchange.getAttributes().put(UPSTREAM_MODEL_KEY, target);
         if (target.equals(inBody)) {
-            return serveBody(exchange, body);
+            return RequestBodyModels.replay(exchange, body);
         }
 
         try {
             ((ObjectNode) root).put("model", target);
-            return serveBody(exchange, MAPPER.writeValueAsBytes(root));
+            return RequestBodyModels.replay(exchange, MAPPER.writeValueAsBytes(root));
         }
         catch (Exception serializationFailed) {
-            return serveBody(exchange, body);
+            return RequestBodyModels.replay(exchange, body);
         }
-    }
-
-    /** 用给定字节换一个可重放的请求；{@code Content-Length} 跟着重算，否则厂商侧要么截断要么拒收。 */
-    private ServerWebExchange serveBody(ServerWebExchange exchange, byte[] bytes) {
-        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
-        ServerHttpRequest decorated = new ServerHttpRequestDecorator(exchange.getRequest()) {
-            @Override
-            public Flux<DataBuffer> getBody() {
-                return Flux.just(buffer);
-            }
-
-            @Override
-            public HttpHeaders getHeaders() {
-                HttpHeaders headers = new HttpHeaders();
-                headers.putAll(super.getHeaders());
-                headers.setContentLength(bytes.length);
-                return headers;
-            }
-        };
-        return exchange.mutate().request(decorated).build();
     }
 
     /** provider 从路由 metadata 取；args 里显式写了就以它为准（逃生舱，也是单测的抓手）。 */
