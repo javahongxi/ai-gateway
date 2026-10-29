@@ -21,8 +21,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
-import org.hongxi.ai.gateway.observability.AccessLogFilter;
-import org.hongxi.ai.gateway.observability.UsageRecordingFilter;
+import org.hongxi.ai.gateway.observability.ResponseObservationFilter;
 import org.hongxi.ai.gateway.support.AlwaysAllowRateLimiter;
 import org.hongxi.ai.gateway.support.GatewayCalls;
 import org.hongxi.ai.gateway.support.GatewayCalls.Outcome;
@@ -98,7 +97,7 @@ class UsageAndAccessLogTest {
         upstream.reset();
         accessLogs = new ListAppender<>();
         accessLogs.start();
-        ((Logger) LoggerFactory.getLogger(AccessLogFilter.ACCESS_LOGGER)).addAppender(accessLogs);
+        ((Logger) LoggerFactory.getLogger(ResponseObservationFilter.ACCESS_LOGGER)).addAppender(accessLogs);
     }
 
     private void callWith(StubUpstream.Scenario scenario) {
@@ -162,7 +161,7 @@ class UsageAndAccessLogTest {
         callWith(StubUpstream.Scenario.ECHO_JSON_WITH_USAGE);
 
         for (String type : List.of("prompt", "completion", "cached", "reasoning")) {
-            assertThat(registry.find(UsageRecordingFilter.USAGE_TOKENS_METRIC).tag("type", type).counter())
+            assertThat(registry.find(ResponseObservationFilter.USAGE_TOKENS_METRIC).tag("type", type).counter())
                     .as("%s 这一条 token 计数应该注册出来", type)
                     .isNotNull();
         }

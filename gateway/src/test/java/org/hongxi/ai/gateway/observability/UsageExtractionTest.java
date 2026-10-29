@@ -16,15 +16,15 @@ class UsageExtractionTest {
 
     private static final String USAGE = StubUpstream.USAGE_JSON;
 
-    private static UsageRecordingFilter.Usage parse(String record) {
-        return UsageRecordingFilter.extract(record);
+    private static ResponseObservationFilter.Usage parse(String record) {
+        return ResponseObservationFilter.extract(record);
     }
 
     @Test
     void nonStreamBodyIsOneRecord() {
         String body = "{\"id\":\"chatcmpl-1\",\"choices\":[{\"message\":{\"content\":\"pong\"}}]," + USAGE + "}";
 
-        assertThat(parse(body)).isEqualTo(new UsageRecordingFilter.Usage(11, 7, 4, 3));
+        assertThat(parse(body)).isEqualTo(new ResponseObservationFilter.Usage(11, 7, 4, 3));
     }
 
     @Test
@@ -33,7 +33,7 @@ class UsageExtractionTest {
                 + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]," + USAGE + "}\n\n"
                 + "data: [DONE]\n\n";
 
-        assertThat(parse(body)).isEqualTo(new UsageRecordingFilter.Usage(11, 7, 4, 3));
+        assertThat(parse(body)).isEqualTo(new ResponseObservationFilter.Usage(11, 7, 4, 3));
     }
 
     /** DashScope 的形状：usage 不在 finish 那个块上，而在它后面多出来的一个块里。 */
@@ -43,7 +43,7 @@ class UsageExtractionTest {
                 + "data: {\"choices\":[]," + USAGE + "}\n\n"
                 + "data: [DONE]\n\n";
 
-        assertThat(parse(body)).isEqualTo(new UsageRecordingFilter.Usage(11, 7, 4, 3));
+        assertThat(parse(body)).isEqualTo(new ResponseObservationFilter.Usage(11, 7, 4, 3));
     }
 
     @Test

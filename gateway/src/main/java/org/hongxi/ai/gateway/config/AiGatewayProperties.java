@@ -40,6 +40,16 @@ public class AiGatewayProperties {
      */
     private boolean generatedRoutes = true;
 
+    /**
+     * 连续多少次语义失败（R14：HTTP 200 但正文里是限流/欠费/审核拒绝）就把该厂商的熔断直接切到
+     * OPEN。中间出现一次正常响应就重新计数，所以它量的是"连续"而不是"累计"。
+     *
+     * <p>为什么不往熔断的滑动窗口里补记一次 {@code onError}：那台状态机已经把这次请求记成了一次
+     * success，再塞一个事件等于同一发请求占两个位置、失败率立刻 50%，一发就能开闸。语义失败是
+     * 另一种信号，就自己数、自己开闸。
+     */
+    private int semanticFailureThreshold = 3;
+
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
@@ -65,6 +75,14 @@ public class AiGatewayProperties {
 
     public void setProviders(Map<String, Provider> providers) {
         this.providers = providers;
+    }
+
+    public int getSemanticFailureThreshold() {
+        return semanticFailureThreshold;
+    }
+
+    public void setSemanticFailureThreshold(int semanticFailureThreshold) {
+        this.semanticFailureThreshold = semanticFailureThreshold;
     }
 
     public RateLimit getRateLimit() {
@@ -224,6 +242,16 @@ public class AiGatewayProperties {
          */
         private Map<String, String> modelMapping = new LinkedHashMap<>();
 
+        /**
+         * 这家厂商在 HTTP 200 的正文里自报失败时用的顶层错误码（限流、欠费、审核拒绝那一类）。
+         * 只与响应的顶层 {@code code}、{@code error.code}、{@code error.type} 做大小写无关的
+         * 等值比较——正文里的自由文本不参与判定。
+         *
+         * <p>每家有哪些码属于部署事实，本文档不替厂商定义；留空就是只依赖那条与厂商无关的结构
+         * 规则（顶层 {@code error} 且无 {@code choices}）。
+         */
+        private List<String> failureIndicators = new ArrayList<>();
+
         public String getBaseUrl() {
             return baseUrl;
         }
@@ -278,6 +306,14 @@ public class AiGatewayProperties {
 
         public void setBackup(String backup) {
             this.backup = backup;
+        }
+
+        public List<String> getFailureIndicators() {
+            return failureIndicators;
+        }
+
+        public void setFailureIndicators(List<String> failureIndicators) {
+            this.failureIndicators = failureIndicators;
         }
 
         public Map<String, String> getModelMapping() {

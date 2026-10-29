@@ -69,6 +69,11 @@ ai-gateway:
       backup: deepseek
       model-mapping:
         chat-default: qwen3.7-plus
+      # R14：这家在 HTTP 200 的正文里自报失败时用的顶层错误码。只与顶层 code /
+      # error.code / error.type 做等值比较，正文自由文本不参与判定。哪些码算属于部署
+      # 事实，这里不替厂商定义；留空就只靠那条与厂商无关的结构规则（顶层有 error 且无
+      # choices）。示例形状：failure-indicators: [Throttling.AllocationQuota]
+      failure-indicators: []
 
   rate-limit:
     # 租户维度：一个租户一个桶，防的是单个调用方打爆网关

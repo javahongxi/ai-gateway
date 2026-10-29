@@ -48,7 +48,11 @@ public final class StubUpstream implements AutoCloseable {
         /** 流式：usage 挂在 finish_reason 那个块上（DeepSeek 的形状）。 */
         SSE_USAGE_ON_FINISH_CHUNK,
         /** 流式：{@code [DONE]} 之前多给一个 {@code choices:[]} 的块带 usage（DashScope 的形状）。 */
-        SSE_USAGE_IN_EXTRA_CHUNK
+        SSE_USAGE_IN_EXTRA_CHUNK,
+        /** 200 + OpenAI 兼容错误体（顶层 {@code error}，没有 {@code choices}）：R14 的结构规则。 */
+        JSON_200_ERROR_BODY,
+        /** 200 + 顶层 {@code code} 自报失败：R14 的 indicator 规则，只在该厂商声明过这个码时才命中。 */
+        JSON_200_TOP_LEVEL_CODE
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -171,6 +175,8 @@ public final class StubUpstream implements AutoCloseable {
                         case ECHO_JSON_WITH_USAGE -> jsonWithUsage(response);
                         case SSE_USAGE_ON_FINISH_CHUNK -> usageOnFinishChunk(response);
                         case SSE_USAGE_IN_EXTRA_CHUNK -> usageInExtraChunk(response);
+                        case JSON_200_ERROR_BODY -> errorBody(response);
+                        case JSON_200_TOP_LEVEL_CODE -> topLevelCode(response);
                         case RESET -> {
                             // 一个字节都不写，直接把 socket 关掉——这才是厂商进程被 kill 的样子。
                             // 之前这里写的是 Mono.error(new IOException(...))，reactor-netty 会替它
@@ -304,6 +310,30 @@ public final class StubUpstream implements AutoCloseable {
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
                 .header("x-request-id", REQUEST_ID)
                 .sendString(stream)
+                .then();
+    }
+
+    /** OpenAI 兼容的错误形状：顶层 error、没有 choices。 */
+    public static final String ERROR_BODY = "{\"error\":{\"message\":\"Too many requests\","
+            + "\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}";
+
+    /** 厂商在顶层 code 上自报失败：没有 error 对象，结构规则不会命中。 */
+    public static final String TOP_LEVEL_CODE_BODY = "{\"code\":\"Throttling.AllocationQuota\","
+            + "\"message\":\"Queue capacity limit exceeded, please retry later\"}";
+
+    private Mono<Void> errorBody(HttpServerResponse response) {
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .header("x-request-id", REQUEST_ID)
+                .sendString(Mono.just(ERROR_BODY))
+                .then();
+    }
+
+    private Mono<Void> topLevelCode(HttpServerResponse response) {
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .header("x-request-id", REQUEST_ID)
+                .sendString(Mono.just(TOP_LEVEL_CODE_BODY))
                 .then();
     }
 
