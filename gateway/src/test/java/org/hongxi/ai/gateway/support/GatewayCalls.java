@@ -66,6 +66,43 @@ public final class GatewayCalls {
                 failure.get(), HttpHeaders.readOnlyHttpHeaders(responseHeaders));
     }
 
+    /** 带一个额外请求头发一次。R13 要验 traceparent 被原样记下来，就得能控制它。 */
+    public Outcome callWithHeader(String path, String authorization, String body, String header, String value) {
+        long started = System.nanoTime();
+        AtomicInteger status = new AtomicInteger();
+        List<String> pieces = new CopyOnWriteArrayList();
+        List<Long> arrivals = new CopyOnWriteArrayList();
+        AtomicReference<Throwable> failure = new AtomicReference();
+        try {
+            client.post()
+                    .uri(path)
+                    .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                    .headers(headers -> {
+                        if (authorization != null) {
+                            headers.set(org.springframework.http.HttpHeaders.AUTHORIZATION, authorization);
+                        }
+                        headers.set(header, value);
+                    })
+                    .bodyValue(body)
+                    .exchangeToFlux(response -> {
+                        status.set(response.statusCode().value());
+                        return response.bodyToFlux(DataBuffer.class);
+                    })
+                    .doOnNext(buffer -> {
+                        pieces.add(read(buffer));
+                        arrivals.add(elapsedSince(started));
+                    })
+                    .then()
+                    .block(java.time.Duration.ofSeconds(20));
+        }
+        catch (RuntimeException timeoutOrAbort) {
+            failure.set(timeoutOrAbort);
+        }
+        return new Outcome(status.get(), String.join("", pieces), elapsedSince(started), List.copyOf(arrivals),
+                failure.get(), org.springframework.http.HttpHeaders.readOnlyHttpHeaders(
+                        new org.springframework.http.HttpHeaders()));
+    }
+
     /** 发一次但不等它结束，用来观察「还挂着的那条流」现在怎么样了。 */
     public LiveCall start(String path, String authorization) {
         AtomicInteger status = new AtomicInteger();

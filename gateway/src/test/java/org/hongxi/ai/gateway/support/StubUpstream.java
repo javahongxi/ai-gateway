@@ -42,7 +42,13 @@ public final class StubUpstream implements AutoCloseable {
         /** 1.5 秒后才回响应头：比 resilience4j TimeLimiter 的默认 1 秒慢，比模型调用快。 */
         SLOW_HEAD,
         /** 连接接了但立刻报错断开：模拟厂商进程被 kill -9，传输层失败。 */
-        RESET
+        RESET,
+        /** 非流式 JSON，带完整 usage（含 cached / reasoning 明细）。 */
+        ECHO_JSON_WITH_USAGE,
+        /** 流式：usage 挂在 finish_reason 那个块上（DeepSeek 的形状）。 */
+        SSE_USAGE_ON_FINISH_CHUNK,
+        /** 流式：{@code [DONE]} 之前多给一个 {@code choices:[]} 的块带 usage（DashScope 的形状）。 */
+        SSE_USAGE_IN_EXTRA_CHUNK
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -162,6 +168,9 @@ public final class StubUpstream implements AutoCloseable {
                         case FAIL_500 -> fail500(response);
                         case SSE_THEN_BREAK -> streamThenBreak(response);
                         case SLOW_HEAD -> slowHead(response);
+                        case ECHO_JSON_WITH_USAGE -> jsonWithUsage(response);
+                        case SSE_USAGE_ON_FINISH_CHUNK -> usageOnFinishChunk(response);
+                        case SSE_USAGE_IN_EXTRA_CHUNK -> usageInExtraChunk(response);
                         case RESET -> {
                             // 一个字节都不写，直接把 socket 关掉——这才是厂商进程被 kill 的样子。
                             // 之前这里写的是 Mono.error(new IOException(...))，reactor-netty 会替它
@@ -242,6 +251,59 @@ public final class StubUpstream implements AutoCloseable {
         return response.status(200)
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
                 .sendString(broken)
+                .then();
+    }
+
+    /**
+     * 三种形状共用那一份用量。R12 的验收标准是"三种形状、同一个数"，所以这四个数必须被同一条
+     * 扫描规则从流式两种分块位置和非流式整段里都捞出来。
+     */
+    public static final String USAGE_JSON = "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,"
+            + "\"total_tokens\":18,\"prompt_tokens_details\":{\"cached_tokens\":4},"
+            + "\"completion_tokens_details\":{\"reasoning_tokens\":3}}";
+
+    /** 厂商自己的请求 id，R13 的 upstreamRequestId 断的就是它。 */
+    public static final String REQUEST_ID = "stub-request-1";
+
+    private Mono<Void> jsonWithUsage(HttpServerResponse response) {
+        String payload = "{\"id\":\"chatcmpl-usage\",\"object\":\"chat.completion\",\"model\":\"stub-model\","
+                + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"pong\"}}],"
+                + USAGE_JSON + "}";
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .header("x-request-id", REQUEST_ID)
+                .sendString(Mono.just(payload))
+                .then();
+    }
+
+    private Mono<Void> usageOnFinishChunk(HttpServerResponse response) {
+        Flux<String> stream = Flux.just(
+                delta("He"),
+                "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],"
+                        + USAGE_JSON + "}\n\n",
+                "data: [DONE]\n\n");
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
+                .header("x-request-id", REQUEST_ID)
+                .sendString(stream)
+                .then();
+    }
+
+    /**
+     * DashScope 的形状：{@code finish_reason} 那个块不带 usage，{@code [DONE]} 之前再多给一个
+     * {@code choices:[]} 的块。"取倒数第二个块"就是在这里错的——两种形状在同一个位置捞，
+     * 得到的一个是数、一个是什么都没有。
+     */
+    private Mono<Void> usageInExtraChunk(HttpServerResponse response) {
+        Flux<String> stream = Flux.just(
+                delta("He"),
+                "data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"1\",\"choices\":[]," + USAGE_JSON + "}\n\n",
+                "data: [DONE]\n\n");
+        return response.status(200)
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_EVENT_STREAM_VALUE)
+                .header("x-request-id", REQUEST_ID)
+                .sendString(stream)
                 .then();
     }
 

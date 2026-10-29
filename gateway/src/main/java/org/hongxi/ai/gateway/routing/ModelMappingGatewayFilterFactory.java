@@ -136,6 +136,9 @@ public class ModelMappingGatewayFilterFactory
                 : inBody;
         exchange.getAttributes().put(REQUESTED_MODEL_KEY, requested);
         String target = mapping.getOrDefault(requested, requested);
+        // 就算这一次没换名字（target 与 inBody 相同），上线的也是它——日志那两个字段要的是事实
+        // 不是"改过才记"
+        exchange.getAttributes().put(UPSTREAM_MODEL_KEY, target);
         if (target.equals(inBody)) {
             return serveBody(exchange, body);
         }
@@ -198,9 +201,17 @@ public class ModelMappingGatewayFilterFactory
         return contentType != null && org.springframework.http.MediaType.APPLICATION_JSON.isCompatibleWith(contentType);
     }
 
-    /** 客户端传的那个模型名，供日志与指标做 requested_model（upstream_model 是改写后的那个）。 */
+    /** 改写真正上线后属性里放的键，与 requested 那个成一对（R13 日志要两个字段）。 */
+    static final String UPSTREAM_MODEL_KEY = "aiGatewayUpstreamModel";
+
+    /** 客户端原本传的模型名（R13 的 requested_model）。 */
     public static String requestedModel(ServerWebExchange exchange) {
         return exchange.getAttribute(REQUESTED_MODEL_KEY);
+    }
+
+    /** 真正上线的模型名（R13 的 upstream_model）。没经过改写的请求为 null，由日志侧退化处理。 */
+    public static String upstreamModel(ServerWebExchange exchange) {
+        return exchange.getAttribute(UPSTREAM_MODEL_KEY);
     }
 
     /**

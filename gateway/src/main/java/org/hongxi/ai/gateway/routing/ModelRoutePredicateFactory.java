@@ -76,6 +76,17 @@ public class ModelRoutePredicateFactory extends AbstractRoutePredicateFactory<Mo
         };
     }
 
+    /**
+     * 本请求被 {@code Model} 谓词解析出来的模型名（同一请求只解析一次，缓存在属性里）。
+     * 访问日志在没走改写的路由上取不到 {@link ModelMappingGatewayFilterFactory#requestedModel}，
+     * 就退回到这里——两者不同源这点本身值得知道：一条路由可以没有改写过滤器，但没有 Model 谓词
+     * 就选不了厂商。
+     */
+    public static String parsedModel(ServerWebExchange exchange) {
+        Object cached = exchange.getAttributes().get(CACHED_MODEL_KEY);
+        return cached == null ? null : cached.toString();
+    }
+
     private static boolean isJsonRequest(ServerWebExchange exchange) {
         MediaType contentType = exchange.getRequest().getHeaders().getContentType();
         return contentType != null && MediaType.APPLICATION_JSON.isCompatibleWith(contentType);
