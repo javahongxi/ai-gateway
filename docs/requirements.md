@@ -37,7 +37,7 @@
 |---|---|---|---|---|
 | R12 | 用量计量 | 同一次对话，流式与非流式拿到同一组 `prompt / completion / cached / reasoning` 数；被拒（401/403/429）与首字节前失败的请求不产生 usage；厂商没回 usage 时记成 `unknown` 而不是 0 | 只读响应装饰器（`order -3`，早于 `NettyWriteResponseFilter` 的 -1）逐块 peek，取第一个带 `completion_tokens` 的块 | 已实现，见决策 D11 |
 | R13 | 请求级结构化日志 | 每个请求产出一行 JSON，含 `tenant / token / route / provider / requested_model / upstream_model / status / 耗时 / ttft / usage / traceId / 上游 request id`；同一 `traceId` 能在日志与 trace 之间对上 | `AccessLogFilter` 一行 JSON；`traceId` 那格只印客户端带来的 `traceparent`（MDC 那半条仍是 D8 的缺口） | 已实现，见决策 D11 |
-| R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 判定发生在响应侧（只读，不改字节），命中后以 `exchange` 属性通知熔断；熔断配置不变 | 未做；现熔断只认错误率，认不出这一类 |
+| R14 | 语义失败识别 | 厂商回 **200 但正文里是错误**（限流、欠费、内容审核拒绝）时，判定表命中并计入熔断一次；连续命中达到阈值后改道备用厂商；关键词与状态码映射表可经 Nacos 热更 | 响应侧只读判定（`ResponseObservationFilter`）；命中后由本类数连续次数并直接 `transitionToOpenState()` | 已实现，见决策 D12 |
 | R15 | 厂商探活与自动恢复 | 熔断打开后，低频探测（`/v1/models`，不调真模型）成功即自动收拢；探测请求不进入业务指标分位数，也不产生 usage | `@Scheduled` + `WebClient`，写熔断状态与一个 gauge | 未做 |
 | R16 | 密钥池 | 同一厂商两把 key 时，厂商维度窗口键按 `provider:key` 分桶——一把 key 被上游限流不影响另一把的配额；日志记用的是哪把（脱敏后 4 位） | provider 声明里的 `keys[]` + `ProviderQuotaFilter` 的键拼接 | 未做，与 D10 同批 |
 | R17 | 令牌维度治理 | 令牌打未授权模型 → 403 且不碰厂商；来源 IP 不在 CIDR 内 → 403；令牌过期 → 401。三条都在限流之前、在碰到厂商之前 | `AiGatewayProperties.tenants` 加 `allowed-models` / `allow-ips` / `expires-at`，判定在 `TenantAuthFilter` | 未做 |
@@ -244,11 +244,30 @@ provider 段至少要说清这些（第四节草稿里已有前三个，其余�
 
 两条一起指向同一个取舍：多读一遍几 KB 的正文，换掉一条会悄悄失效的跨层通道。真有大正文的量级再说，那是 `Flux` 上的一次 `scan` 而不是重构。
 
+第三个消费者（R14 语义失败）出现时，两个观察者合并成了一个 `ResponseObservationFilter`：一次 peek、三个出口（token 计数、语义开闸、日志一行）。两遍读字节已经是要解释的账，三遍说不下去。合并重复的是**读字节**，判断逻辑仍然只有一份（`extract` 与 `detectSemanticFailure` 都是静态纯函数，可单测）。
+
 顺手记三条实现层的，都各红过一次：
 
 - `statusCode` 要在**写字节那一刻**记，不能在 `doFinally` 里读。读到的可能是 null，于是所有正常响应都被判成"没发生"，用量全线静默归零。
 - 厂商没回 usage 时记 `absent`（`ai.gateway.usage.samples{outcome=absent}`），日志里是字符串 `unknown`，**不是四个 0**。把"没采到"印成"用了 0"是指标最典型的说谎方式，而真机确实会这样。
 - 扫描规则是"逐块扫，取第一个带 `completion_tokens` 的"，不是"倒数第二个块"。桩里三个场景（非流式、DeepSeek 把 usage 挂在 finish 块、DashScope 在 `[DONE]` 前多给一个 `choices: []` 的块）走同一条规则得到同一组数，这条以前只是文档里的一句话。
+
+### D12 语义失败的开闸方式：自己数连续命中，不往熔断窗口补记事件
+
+`状态：已实现。`
+
+厂商回 HTTP 200、正文里是限流/欠费/审核拒绝，这一类错误率看不见。判定命中之后有两条路能把它接进熔断：调 `CircuitBreaker#onError`，或者自己数连续次数、到阈值直接 `transitionToOpenState()`。先选的是前者，被用例打回：
+
+熔断那台状态机已经把这次请求记成了一次 **success**（HTTP 确实 200）。再塞一个 `onError` 事件，窗口里这一发就占了**两个位置**、失败率立刻 50%——窗口 2、阈值 50 的配置下**一发**就把闸打开了，`upstream.hits` 少一次就是这么来的。同一发请求记两笔账不是"连续失败"的语义。
+
+所以现在：`ai-gateway.semantic-failure-threshold`（默认 3）数**连续**命中，中间出现一次正常响应就清零；到阈值直接开闸，之后半开探测由熔断自己的配置负责。反证做过——阈值改成 99，用例里的闸门状态就停在 `CLOSED`，说明断言真的在测开闸而不是在测窗口默认行为。
+
+判定面只有两条，都只看**顶层结构化字段**：
+
+- `structural`：顶层有 `error` 对象且没有 `choices`（OpenAI 兼容错误体），与厂商无关。
+- `indicator`：顶层 `code`（或 `error.code` / `error.type`）等值命中该厂商 `failure-indicators` 声明的码；大小写无关，不做前缀或包含匹配。
+
+**不做自由文本子串搜索**：模型的回答里出现 "quota exceeded" 是常态，误判会把一次正常调用记成厂商故障并无谓开闸；误判的代价比漏判大，漏判还有错误率兜着。规则单测里专门有一条盯它（带 `choices`、正文写着 "your quota exceeded" 的成功响应必须不命中）。哪些厂商有哪些码属于部署事实，本仓库不替厂商定义——测试里那些字符串是桩造的。
 
 ## 四、配置
 
@@ -347,6 +366,9 @@ R12 到 R20 这一批**不新增其他依赖**：usage 采集与语义失败判�
 | 三种 usage 形状（非流式、usage 在 finish 块、usage 在多给的 `choices:[]` 块）得到同一组数 | `UsageAndAccessLogTest#allThreeUsageShapesLogTheSameNumbers` + `UsageExtractionTest` 5 条把扫描规则单独钉住 |
 | 厂商没回 usage 时是 `absent` / 日志里 `unknown`，不是 0 | `#responseWithoutUsageLogsUnknownRatherThanZeros`；被鉴权挡掉的请求同样不产生 usage 且 `upstream.requests()` 为 0（`#rejectedRequestStillLogsOneLineButCarriesNoUsage`） |
 | 访问日志一行带齐 `tenant/route/provider/requestedModel/upstreamModel/status/elapsedMs/ttftMs/usage/traceparent/upstreamRequestId` | `#accessLineCarriesBothModelNamesAndTheUpstreamRequestId`；两个模型名分开是 D9 那条改写的可见性来源 |
+| 200 + 错误体原样发给客户端，同时记 `semanticFailure` 与指标 | `SemanticFailureCircuitTest#semanticFailureIsPassedThroughButRecorded`；判定规则另有 8 条单测（`SemanticFailureRulesTest`） |
+| 连续语义命中到阈值即开闸，之后厂商恢复也被绕开 | `#repeatedHitsOpenTheBreakerAndRouteAroundTheProvider`；反证：阈值改成 99 时闸门停在 `CLOSED` |
+| 正常响应不命中，自由文本里的 "quota exceeded" 也不命中 | `SemanticFailureRulesTest#successfulResponsesAreNeverSemanticFailures`、`#choicesWinOverErrorSoPartialFailuresAreNotCounted` |
 | 内层过滤器写的属性，外层 `doFinally` 读不到（跨 `mutate()`） | 现象是"整包跑红、单跑绿"，机制与取舍见决策 D11 |
 | 日志行落在客户端完成之后，断言必须等它变多而不是数条数 | `awaitNewLine(before)`，见 D11 第二条 |
 | 日志 MDC 里没有 traceId（已知缺口） | `ObservabilityTest#traceIdIsNotInMdcUnderTheOtelBridge`，见决策 D8 |
@@ -401,7 +423,7 @@ instrumentation 是它的候选解）。本批新增的 R12–R21 与 D9/D10 全
 | 四 | R3 模型路由与灰度 | 按 `model` 分流，权重切换不产生半处理连接 | 已完成（含真机验证），见 D7 |
 | 五 | 剩余两条实测回填（熔断回跳与 Weight） | 两条都结论化进本表 | **已完成**。Weight 那半条由 `ModelRoutingTest#weightAndABodyReadingPredicateCoexistOnTheSameGroup` 与 `#theBodyStillReachesTheProviderByteForByteAfterThePredicateReadsIt` 钉着；熔断那半条原先只有源码级结论（`enableBodyCaching(routeId)`），现在 `CircuitBreakerFailoverTest#deadPrimaryIsServedByTheBackup` 补了一条 body 逐字节断言，并用哨兵值验过它真的会红（不是空断言）。R10 的租户热更已在二期前测过 |
 | 六 | D10 的 providers 段与路由生成 + D9 的请求侧 model 改写 | 备份关系不再手写；三条顺序约束各有单测；改道后模型名换成备用厂商的真名 | 已完成（真机 `ProviderLiveTest` 3 条走的就是生成路由；跨厂商改道的 `unsupported model` 用桩证伪，机制与剩余未验项见 D9/D10） |
-| 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 部分完成：R12 与 R13 已落地（机制与两处实测发现见 D11）；R14、R15 未做 |
+| 七 | R12 计量 + R13 结构化日志 + R14 语义失败 + R15 探活恢复 | usage 四个数在指标与日志里可见；200-with-error-body 会被计进熔断并改道；熔断打开后能自动收拢 | 部分完成：R12、R13 已落地（见 D11），R14 已落地（见 D12）；只剩 R15 探活与自动恢复未做 |
 | 八 | R16 密钥池 + R17 令牌治理 + R18 余额探活 | 一把 key 被上游限流不拖累另一把；未授权模型 403 且不碰厂商；余额 gauge 可见 | 未做 |
 | 九 | R20 虚拟模型名与升档重试 + R21 跨协议入口 | 一个对外名字后面挂多家、失败换档；三种入口进同一家出且 TTFT 不恶化 | 未做。R21 需要 D1 的第二个例外，届时单独成决策 |
 
