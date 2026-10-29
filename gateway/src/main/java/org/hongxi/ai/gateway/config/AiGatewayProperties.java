@@ -50,6 +50,9 @@ public class AiGatewayProperties {
      */
     private int semanticFailureThreshold = 3;
 
+    /** 探活与自动恢复（R15）。 */
+    private Probe probe = new Probe();
+
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
@@ -83,6 +86,14 @@ public class AiGatewayProperties {
 
     public void setSemanticFailureThreshold(int semanticFailureThreshold) {
         this.semanticFailureThreshold = semanticFailureThreshold;
+    }
+
+    public Probe getProbe() {
+        return probe;
+    }
+
+    public void setProbe(Probe probe) {
+        this.probe = probe;
     }
 
     public RateLimit getRateLimit() {
@@ -243,6 +254,12 @@ public class AiGatewayProperties {
         private Map<String, String> modelMapping = new LinkedHashMap<>();
 
         /**
+         * 探活端点（R15），通常是厂商的模型列表：OpenAI 兼容就是 {@code /v1/models}，带前缀的
+         * 要写全。留空表示不探这家——不猜端点，猜错的探测比没有探测更糟。
+         */
+        private String healthPath;
+
+        /**
          * 这家厂商在 HTTP 200 的正文里自报失败时用的顶层错误码（限流、欠费、审核拒绝那一类）。
          * 只与响应的顶层 {@code code}、{@code error.code}、{@code error.type} 做大小写无关的
          * 等值比较——正文里的自由文本不参与判定。
@@ -308,6 +325,14 @@ public class AiGatewayProperties {
             this.backup = backup;
         }
 
+        public String getHealthPath() {
+            return healthPath;
+        }
+
+        public void setHealthPath(String healthPath) {
+            this.healthPath = healthPath;
+        }
+
         public List<String> getFailureIndicators() {
             return failureIndicators;
         }
@@ -322,6 +347,46 @@ public class AiGatewayProperties {
 
         public void setModelMapping(Map<String, String> modelMapping) {
             this.modelMapping = modelMapping;
+        }
+    }
+
+    /**
+     * 厂商探活。默认开着，但只探"已经被熔断判死"且声明了 {@code health-path} 的厂商，所以
+     * 什么都不配时它一次外部请求都不发。
+     */
+    public static class Probe {
+
+        /** 关掉它就只剩熔断自己的半开探测。 */
+        private boolean enabled = true;
+
+        /** 间隔。太短会变成给厂商刷接口，太长又不如等半开。 */
+        private java.time.Duration interval = java.time.Duration.ofSeconds(30);
+
+        /** 单次探测的总预算，含建连与读响应头。 */
+        private java.time.Duration timeout = java.time.Duration.ofSeconds(5);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public java.time.Duration getInterval() {
+            return interval;
+        }
+
+        public void setInterval(java.time.Duration interval) {
+            this.interval = interval;
+        }
+
+        public java.time.Duration getTimeout() {
+            return timeout;
+        }
+
+        public void setTimeout(java.time.Duration timeout) {
+            this.timeout = timeout;
         }
     }
 }

@@ -3,6 +3,7 @@ package org.hongxi.ai.gateway;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
 import org.hongxi.ai.gateway.config.UpstreamProperties;
@@ -13,6 +14,7 @@ import org.hongxi.ai.gateway.config.UpstreamProperties;
  * {@code UpstreamIdleTimeoutCustomizer}。
  */
 @SpringBootApplication
+@EnableScheduling
 @EnableConfigurationProperties({ AiGatewayProperties.class, UpstreamProperties.class })
 public class GatewayApplication {
     public static void main(String[] args) {

@@ -67,6 +67,7 @@ ai-gateway:
       response-timeout: 120000
       connect-timeout: 3000
       backup: deepseek
+      health-path: /compatible-mode/v1/models
       model-mapping:
         chat-default: qwen3.7-plus
       # R14：这家在 HTTP 200 的正文里自报失败时用的顶层错误码。只与顶层 code /
@@ -74,6 +75,14 @@ ai-gateway:
       # 事实，这里不替厂商定义；留空就只靠那条与厂商无关的结构规则（顶层有 error 且无
       # choices）。示例形状：failure-indicators: [Throttling.AllocationQuota]
       failure-indicators: []
+
+  # 探活（R15）。只探"已经被熔断判死"且配了 health-path 的厂商，所以这两家之外的一次都不发；
+  # 探到 2xx 才收闸，探到非 2xx 只记指标——判死归熔断自己管，这里不抢它的状态机。
+  # 探测走独立连接、绕开过滤器链，因此不进业务延迟分位数、不产生 usage、不落访问日志。
+  probe:
+    enabled: true
+    interval: 30s
+    timeout: 5s
 
   rate-limit:
     # 租户维度：一个租户一个桶，防的是单个调用方打爆网关
