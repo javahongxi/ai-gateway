@@ -59,6 +59,7 @@ public final class StubUpstream implements AutoCloseable {
     private final AtomicReference<String> tenant = new AtomicReference<>();
     private final AtomicReference<String> traceparent = new AtomicReference<>();
     private final AtomicReference<String> body = new AtomicReference<>();
+    private final AtomicReference<String> contentLength = new AtomicReference<>();
     private final AtomicInteger requests = new AtomicInteger();
     private final List<String> paths = new java.util.concurrent.CopyOnWriteArrayList<>();
 
@@ -114,6 +115,14 @@ public final class StubUpstream implements AutoCloseable {
         return body.get();
     }
 
+    /**
+     * 桩看到的 {@code Content-Length}。D9 改写请求体之后长度必须重算，这条断言就是钉它的：
+     * 长度与字节不一致时，厂商侧要么截断要么拒收，而那在网关日志里长得像厂商的毛病。
+     */
+    public String contentLength() {
+        return contentLength.get();
+    }
+
     public int requests() {
         return requests.get();
     }
@@ -142,6 +151,7 @@ public final class StubUpstream implements AutoCloseable {
                     tenant.set(request.requestHeaders().get("X-Tenant-Id"));
                     traceparent.set(request.requestHeaders().get("traceparent"));
                     body.set(payload);
+                    contentLength.set(request.requestHeaders().get(HttpHeaders.CONTENT_LENGTH));
                     requests.incrementAndGet();
                     paths.add(request.fullPath());
                     return switch (scenario.get()) {

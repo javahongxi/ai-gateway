@@ -27,6 +27,19 @@ public class AiGatewayProperties {
     /** 租户名到其属性的映射，键只是给人看的标识。 */
     private Map<String, Tenant> tenants = new LinkedHashMap<>();
 
+    /**
+     * 厂商声明。非空时由 {@code ProviderRouteDefinitionLocator} 生成路由，见决策 D10：
+     * 备份关系、过滤器顺序这些规则进代码就能被单测钉住，留在 yml 里只能靠人记。
+     */
+    private Map<String, Provider> providers = new LinkedHashMap<>();
+
+    /**
+     * 是否由 {@code providers} 声明生成路由。生产保持默认 {@code true}；测试类自带路由表时关掉它
+     * ——否则声明里那个不认领模型名的兜底厂商会抢走「没人认领的模型该 404」这类断言。
+     * 这个开关也是运维用的急停闸：生成器出了问题时一行配置就能退回手写路由。
+     */
+    private boolean generatedRoutes = true;
+
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
@@ -36,6 +49,22 @@ public class AiGatewayProperties {
 
     public void setTenants(Map<String, Tenant> tenants) {
         this.tenants = tenants;
+    }
+
+    public boolean isGeneratedRoutes() {
+        return generatedRoutes;
+    }
+
+    public void setGeneratedRoutes(boolean generatedRoutes) {
+        this.generatedRoutes = generatedRoutes;
+    }
+
+    public Map<String, Provider> getProviders() {
+        return providers;
+    }
+
+    public void setProviders(Map<String, Provider> providers) {
+        this.providers = providers;
     }
 
     public RateLimit getRateLimit() {
@@ -145,6 +174,118 @@ public class AiGatewayProperties {
 
         public boolean allows(String provider) {
             return providers == null || providers.isEmpty() || providers.contains(provider);
+        }
+    }
+
+    /**
+     * 一个厂商的声明。这些字段合起来就是原先手写在路由表里的那六条，出处见决策 D10；
+     * 生成器产出的路由 id 与迁移前一致，指标与仪表板不用改。
+     *
+     * <p>同样是可变形 JavaBean（理由见类注释 D4）：整段都靠 Nacos 热更，改 key 或改映射不该重启。
+     */
+    public static class Provider {
+
+        /** 厂商根地址，例如 {@code https://dashscope.aliyuncs.com}。 */
+        private String baseUrl;
+
+        /**
+         * 该厂商的 OpenAI 兼容 chat 端点路径，路由的 {@code SetPath} 就用它。
+         * 与对外入口路径可以不同（DashScope 多一段 {@code /compatible-mode}）。
+         */
+        private String chatPath;
+
+        /**
+         * 上游凭证。配置里写 {@code ${DASHSCOPE_API_KEY}}，绑定时就解析完了——生成器不需要
+         * 知道占位符这件事。
+         */
+        private String keyRef;
+
+        /**
+         * 这个厂商认领的模型名通配（对应 {@code Model} 谓词）。为空表示它是兜底厂商，
+         * 生成时排在所有专名之后——路由顺序就是优先级，见 D7。
+         */
+        private List<String> models = new ArrayList<>();
+
+        /** 等响应头的预算，毫秒。写进路由 metadata，只接受数字（D2）。 */
+        private long responseTimeout = 120000;
+
+        /** 建连预算，毫秒。 */
+        private long connectTimeout = 3000;
+
+        /**
+         * 主厂商失败时改道去哪个厂商的别名；为空表示这条路由不挂熔断（备份路由自己就是最后
+         * 那道防线）。
+         */
+        private String backup;
+
+        /**
+         * 客户端模型名到本厂商真实模型名的映射，决策 D9 的数据来源。表里没有的名字原样透传，
+         * 不报错——未知模型让厂商自己回 4xx，网关不替它编名字。
+         */
+        private Map<String, String> modelMapping = new LinkedHashMap<>();
+
+        public String getBaseUrl() {
+            return baseUrl;
+        }
+
+        public void setBaseUrl(String baseUrl) {
+            this.baseUrl = baseUrl;
+        }
+
+        public String getChatPath() {
+            return chatPath;
+        }
+
+        public void setChatPath(String chatPath) {
+            this.chatPath = chatPath;
+        }
+
+        public String getKeyRef() {
+            return keyRef;
+        }
+
+        public void setKeyRef(String keyRef) {
+            this.keyRef = keyRef;
+        }
+
+        public List<String> getModels() {
+            return models;
+        }
+
+        public void setModels(List<String> models) {
+            this.models = models;
+        }
+
+        public long getResponseTimeout() {
+            return responseTimeout;
+        }
+
+        public void setResponseTimeout(long responseTimeout) {
+            this.responseTimeout = responseTimeout;
+        }
+
+        public long getConnectTimeout() {
+            return connectTimeout;
+        }
+
+        public void setConnectTimeout(long connectTimeout) {
+            this.connectTimeout = connectTimeout;
+        }
+
+        public String getBackup() {
+            return backup;
+        }
+
+        public void setBackup(String backup) {
+            this.backup = backup;
+        }
+
+        public Map<String, String> getModelMapping() {
+            return modelMapping;
+        }
+
+        public void setModelMapping(Map<String, String> modelMapping) {
+            this.modelMapping = modelMapping;
         }
     }
 }

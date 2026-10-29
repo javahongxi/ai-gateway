@@ -26,114 +26,50 @@ spring:
                 redis-rate-limiter.replenishRate: ${ai-gateway.rate-limit.tenant-replenish-rate}
                 redis-rate-limiter.burstCapacity: ${ai-gateway.rate-limit.tenant-burst-capacity}
                 redis-rate-limiter.requestedTokens: ${ai-gateway.rate-limit.tenant-requested-tokens}
-          # 路由表。Nacos 里的 ai-gateway.yaml 覆盖这一段，改完即时生效——
-          # spring-cloud-gateway 的 RouteRefreshListener 监听配置刷新事件。
-          # 上游凭证用 SetRequestHeader 注入：网关不改写报文，只换 host、归一 path、换 key。
+          # 路由表由 ai-gateway.providers 生成（决策 D10，代码在 ProviderRouteDefinitionLocator）。
+          # 原先手写的六条路由——两家各一条对外、一条点名前缀、一条内部备份——现在由生成器产出，
+          # 路由 id 与迁移前一致。三条只能靠人记的规则也随之进了代码并被单测钉住：专名在前兜底在后、
+          # CircuitBreaker 排在 SetPath/SetRequestHeader 之前（D6.1）、备份路由自己不挂熔断。
+          # spring...routes 这一段仍然可用，且优先于生成的路由（生成的带 order=1000），所以它现在是
+          # 逃生舱：临时手写一条顶掉某条生成路由是有效手段，不是错觉。
           #
-          # R6 拓扑：两家互为备份。公开路由挂熔断，失败时 forward 到一条内部备份路由，
-          # 由 DispatcherHandler 重新匹配——这是 CircuitBreaker 的 fallbackUri 能改道到
-          # 另一个厂商的原因（它 reset 掉上游连接后重走一遍 handler 分发）。
-          # 顺序要求：CircuitBreaker 必须排在 SetPath / SetRequestHeader **之前**。它改道时用的
-          # 是自己看到的那个 request，若厂商 key 已被前面的过滤器换进去，重投递时鉴权读到的
-          # 就是厂商 key，直接 401（实测踩过）。
-          # 一条现实约束：改道之后的请求体里 model 还是原厂商的名字，两家都能服务的模型才能这样
-          # 互为备份；要按厂商改写 model 就得动报文，与决策 D1 相冲，留给 R3 一并解决（见 D6）。
-          routes:
-            # R3 模型路由：同一个 /v1/chat/completions 入口，按请求体里的 model 选厂商。
-            # 顺序就是优先级——SCG 取第一条匹配的路由，所以专名放前面、兜底放后面。
-            - id: deepseek-by-model
-              uri: https://api.deepseek.com
-              predicates:
-                - Path=/v1/chat/completions
-                - Model=deepseek*
-              metadata:
-                provider: deepseek
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - name: CircuitBreaker
-                  args:
-                    name: deepseek
-                    fallbackUri: forward:/backup/dashscope/v1/chat/completions
-                - SetPath=/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
-            - id: dashscope-chat
-              uri: https://dashscope.aliyuncs.com
-              predicates:
-                - Path=/v1/chat/completions
-              metadata:
-                provider: dashscope
-                # 单位是毫秒，且必须是数字：NettyRoutingFilter 用 Long.parseLong /
-                # Integer.parseInt 读这两个键，写 "120s" 会被静默忽略（response-timeout 回落到
-                # 全局值）或直接抛 NumberFormatException（connect-timeout）。见 docs/requirements.md D2
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - name: CircuitBreaker
-                  args:
-                    name: dashscope
-                    fallbackUri: forward:/backup/deepseek/v1/chat/completions
-                - SetPath=/compatible-mode/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
-            # 指定厂商走路径前缀：客户端把 base_url 换成 .../dashscope/v1 或 .../deepseek/v1
-            # 就点名了厂商，不看 model 字段。不点名时由上面两条按 model 分流、兜底给 dashscope。
-            - id: dashscope-chat-direct
-              uri: https://dashscope.aliyuncs.com
-              predicates:
-                - Path=/dashscope/v1/chat/completions
-              metadata:
-                provider: dashscope
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - name: CircuitBreaker
-                  args:
-                    name: dashscope
-                    fallbackUri: forward:/backup/deepseek/v1/chat/completions
-                - SetPath=/compatible-mode/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
-            - id: deepseek-chat
-              uri: https://api.deepseek.com
-              predicates:
-                - Path=/deepseek/v1/chat/completions
-              metadata:
-                provider: deepseek
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - name: CircuitBreaker
-                  args:
-                    name: deepseek
-                    fallbackUri: forward:/backup/dashscope/v1/chat/completions
-                - SetPath=/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
-            # 两条内部备份路由：只被 forward 命中，自己不再挂熔断（它们是最后那道防线）。
-            # 路径带 /backup/ 前缀，客户端不该直接打——真要指定厂商，用上面两条公开路由。
-            - id: backup-deepseek
-              uri: https://api.deepseek.com
-              predicates:
-                - Path=/backup/deepseek/v1/chat/completions
-              metadata:
-                provider: deepseek
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - SetPath=/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DEEPSEEK_API_KEY:}
-            - id: backup-dashscope
-              uri: https://dashscope.aliyuncs.com
-              predicates:
-                - Path=/backup/dashscope/v1/chat/completions
-              metadata:
-                provider: dashscope
-                response-timeout: 120000
-                connect-timeout: 3000
-              filters:
-                - SetPath=/compatible-mode/v1/chat/completions
-                - SetRequestHeader=Authorization,Bearer ${DASHSCOPE_API_KEY:}
+          # 上游凭证仍由 SetRequestHeader 注入（生成器做同一件事）：网关不改写报文主体，只换 host、
+          # 归一 path、换 key；模型名的定向改写是 D9 开的那个唯一例外。
+          routes: []
 
 # 自定义段用顶层前缀，不挤进 spring.*
 ai-gateway:
+  # 厂商声明。路由由它生成（ProviderRouteDefinitionLocator，决策 D10）：对外入口
+  # /v1/chat/completions、点名入口 /{alias}/v1/chat/completions、内部备份
+  # /backup/{alias}/v1/chat/completions。改这一段即时生效，靠的是 D4 那条「必须是 JavaBean」。
+  #
+  # 密钥走环境变量，不进仓库；没配就照常启动，调用时由厂商回 401——那是最容易被读到的信号，
+  # 比网关自己编一个「key 缺失」的错误码更接近事实。生产上密钥只在进程环境里。
+  providers:
+    deepseek:
+      base-url: https://api.deepseek.com
+      chat-path: /v1/chat/completions
+      key-ref: ${DEEPSEEK_API_KEY:}
+      # 专名厂商：Model 谓词认领这些名字；认领了模型的排在兜底之前（顺序就是优先级，见 D7）
+      models: [ deepseek* ]
+      response-timeout: 120000
+      connect-timeout: 3000
+      backup: dashscope
+      # D9：客户端传一个名字，各厂商报自己的真名。表里没有的名字原样透传，网关不替厂商编名字。
+      model-mapping:
+        chat-default: deepseek-v4-flash
+    dashscope:
+      base-url: https://dashscope.aliyuncs.com
+      # 与对外入口可以不同：DashScope 的 OpenAI 兼容端点多了 /compatible-mode 一段
+      chat-path: /compatible-mode/v1/chat/completions
+      key-ref: ${DASHSCOPE_API_KEY:}
+      models: []
+      response-timeout: 120000
+      connect-timeout: 3000
+      backup: deepseek
+      model-mapping:
+        chat-default: qwen3.7-plus
+
   rate-limit:
     # 租户维度：一个租户一个桶，防的是单个调用方打爆网关
     tenant-replenish-rate: 5

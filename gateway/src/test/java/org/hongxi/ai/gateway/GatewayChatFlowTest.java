@@ -46,6 +46,9 @@ import static org.assertj.core.api.Assertions.assertThat;
         "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
         // 本类要测的是「response-timeout 管不到流中途」，所以把 R11 的看门狗关掉；
         // 它生效时的行为由 UpstreamIdleTimeoutTest 钉
+// 本类的路由是自己注入的（见 @DynamicPropertySource），关掉由 ai-gateway.providers
+// 声明生成路由那一档，否则生产声明里的兜底路由会抢走「没人认领的模型」这类断言
+        "ai-gateway.generated-routes=false",
         "ai-gateway.upstream.idle-timeout=0",
         // 三个测试类各自一个上下文，固定运维端口会互相抢；测试里随机化
         "management.server.port=0",

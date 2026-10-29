@@ -41,6 +41,9 @@ import static org.assertj.core.api.Assertions.assertThat;
         "ai-gateway.test-context=observability",
         "spring.cloud.nacos.config.import-check.enabled=false",
         "logging.level.com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader=OFF",
+// 本类的路由是自己注入的（见 @DynamicPropertySource），关掉由 ai-gateway.providers
+// 声明生成路由那一档，否则生产声明里的兜底路由会抢走「没人认领的模型」这类断言
+        "ai-gateway.generated-routes=false",
         "ai-gateway.upstream.idle-timeout=0",
         "management.server.port=0",
         "management.tracing.sampling.probability=1.0",

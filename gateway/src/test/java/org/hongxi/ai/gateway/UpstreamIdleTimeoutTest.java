@@ -35,6 +35,8 @@ import static org.assertj.core.api.Assertions.assertThat;
         // 不看 @DynamicPropertySource 贡献的值——两个类的光看注解会算同一个上下文，
         // 路由表就被前一个类复用了（实测整类跑时指标断言会飘）。
         "ai-gateway.test-context=idle-timeout",
+        // 本类的路由是自己注入的，关掉由 ai-gateway.providers 声明生成路由那一档
+        "ai-gateway.generated-routes=false",
         "spring.cloud.nacos.config.import-check.enabled=false",
         // default-filters 里挂的是真限流（要 Redis、会扣配额），这些用例不测它
         // 主 yml 里的 optional:nacos import 仍会被处理（spring.config.import= 清空不了

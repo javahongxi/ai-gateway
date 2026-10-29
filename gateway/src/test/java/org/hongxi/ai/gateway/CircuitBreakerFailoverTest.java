@@ -50,6 +50,9 @@ import static org.assertj.core.api.Assertions.assertThat;
         // 剩下几条（AbstractErrorWebExceptionHandler 的 500 与 PrematureCloseException 栈）
         // 就是 reset 那条用例的正常产物，logger 名在 Boot 4 里挪过位置，不去逐个压——
         // 生产上这两条正是要看的信号，为了日志干净把它们关掉是反的。
+// 本类的路由是自己注入的（见 @DynamicPropertySource），关掉由 ai-gateway.providers
+// 声明生成路由那一档，否则生产声明里的兜底路由会抢走「没人认领的模型」这类断言
+        "ai-gateway.generated-routes=false",
         "ai-gateway.upstream.idle-timeout=0",
         "management.server.port=0",
         "ai-gateway.tenants.alpha.api-key=sk-alpha",
