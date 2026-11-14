@@ -11,25 +11,25 @@
 [doc/threading-model.md](doc/threading-model.md)，后端服务调用的接管见
 [doc/scg-upstream-routing.md](doc/scg-upstream-routing.md)。下表按执行顺序列出全部过滤器：
 
-| 过滤器类 | 类型 | order | 作用 |
-|---|---|---|---|
-| RequestMetricsFilter | GlobalFilter | HIGHEST | 请求指标（含被拒） |
-| ResponseObservationFilter | GlobalFilter | HIGHEST+1 | 读 usage、结算 token、冷却 key |
-| TenantAuthFilter | GlobalFilter | HIGHEST+10 | 租户鉴权与治理 |
-| FirstTokenMetricsFilter | GlobalFilter | -2 | 首字节耗时 TTFT |
-| **NettyWriteResponseFilter** | GlobalFilter | -1 | 写回后端服务响应体 |
-| RetryAfterFilter | GlobalFilter | 0 | 429 兜底 Retry-After |
-| **RequestRateLimiter** | GatewayFilter | 1 | 租户请求数限流 |
-| **Retry** | GatewayFilter | 1 | 首字节前重试（默认关） |
-| **CircuitBreaker** | GatewayFilter | 2 | 熔断与改道 |
-| ProviderKey | GatewayFilter | 3 | 选 key、换 Authorization |
-| ModelMapping | GatewayFilter | 4 | 改请求 model 名 |
-| **SetPath** | GatewayFilter | 5 | 改后端服务路径 |
-| TokenQuotaFilter | GlobalFilter | 95 | 租户 token 预扣（默认关） |
-| ProviderQuotaFilter | GlobalFilter | 100 | 厂商配额限流 |
-| **RouteToRequestUrlFilter** | GlobalFilter | 10000 | 拼后端服务 URL |
-| **NettyRoutingFilter** | GlobalFilter | LOWEST | 发起后端服务 HTTP 调用 |
-| **ForwardRoutingFilter** | GlobalFilter | LOWEST | forward 本地分发 |
+| 过滤器类                     | 类型          | order      | 作用                           |
+|------------------------------|---------------|------------|--------------------------------|
+| RequestMetricsFilter         | GlobalFilter  | HIGHEST    | 请求指标（含被拒）             |
+| ResponseObservationFilter    | GlobalFilter  | HIGHEST+1  | 读 usage、结算 token、冷却 key |
+| TenantAuthFilter             | GlobalFilter  | HIGHEST+10 | 租户鉴权与治理                 |
+| FirstTokenMetricsFilter      | GlobalFilter  | -2         | 首字节耗时 TTFT                |
+| **NettyWriteResponseFilter** | GlobalFilter  | -1         | 写回后端服务响应体             |
+| RetryAfterFilter             | GlobalFilter  | 0          | 429 兜底 Retry-After           |
+| **RequestRateLimiter**       | GatewayFilter | 1          | 租户请求数限流                 |
+| **Retry**                    | GatewayFilter | 1          | 首字节前重试（默认关）         |
+| **CircuitBreaker**           | GatewayFilter | 2          | 熔断与改道                     |
+| ProviderKey                  | GatewayFilter | 3          | 选 key、换 Authorization       |
+| ModelMapping                 | GatewayFilter | 4          | 改请求 model 名                |
+| **SetPath**                  | GatewayFilter | 5          | 改后端服务路径                 |
+| TokenQuotaFilter             | GlobalFilter  | 95         | 租户 token 预扣（默认关）      |
+| ProviderQuotaFilter          | GlobalFilter  | 100        | 厂商配额限流                   |
+| **RouteToRequestUrlFilter**  | GlobalFilter  | 10000      | 拼后端服务 URL                 |
+| **NettyRoutingFilter**       | GlobalFilter  | LOWEST     | 发起后端服务 HTTP 调用         |
+| **ForwardRoutingFilter**     | GlobalFilter  | LOWEST     | forward 本地分发               |
 
 几点说明：
 
