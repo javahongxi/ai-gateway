@@ -33,6 +33,21 @@ RequestMetrics(HIGHEST) → ResponseObservation(HIGHEST+1) → TenantAuth(HIGHES
 即没有把活儿甩到弹性线程池，纪律就是「event loop 上不阻塞」。SSE 正文也是 event loop 直接从
 上游连接搬给客户端。
 
+**这条链上的过滤器有两种接口**——`GatewayFilter` 与 `GlobalFilter`，本项目两种都在用：
+
+| | `GatewayFilter` | `GlobalFilter` |
+|---|---|---|
+| 作用范围 | 单条路由，按路由配置挂载 | 所有路由，全局生效 |
+| 怎么来 | 由 `GatewayFilterFactory` 生产 | 注册成 Spring Bean，实现 `GlobalFilter` 接口 |
+| 配置方式 | 路由定义里的 `filters: [...]`（或生成器挂上去） | 无需配置，容器里有就生效 |
+| 本项目 | `ModelMappingGatewayFilterFactory`、`ProviderKeyGatewayFilterFactory`——改模型名、换厂商 key，只挂需要的厂商路由 | 鉴权/观测/限流：`TenantAuthFilter`、`RequestMetricsFilter`、`ResponseObservationFilter`、`FirstTokenMetricsFilter`、`RetryAfterFilter`、`TokenQuotaFilter`、`ProviderQuotaFilter` |
+
+运行时两者**统一成一条 `GatewayFilter` 链**：`FilteringWebHandler` 把每个 `GlobalFilter` 用
+`GatewayFilterAdapter` 包成 `GatewayFilter`，再和路由自带的 `GatewayFilter` 合并、按 `Order` 一起
+排序。所以上面那条链能把全局过滤器（`TenantAuth=HIGHEST+10`、`TokenQuota=95`）和路由过滤器
+（`ProviderKey`、`ModelMapping`）混排——适配后它们就是同一条链上的节点，也都跑在同一组 event loop 上。
+严格说 SCG 对外暴露的是两种编程接口，底层执行时只有一种 `GatewayFilter` 链。
+
 ### 2. 共享状态 I/O：Lettuce/Redis event loop
 限流脚本、token 记账、R25 冷却/开闸读写都走 `ReactiveStringRedisTemplate`。写侧一律
 fire-and-forget（`.onErrorResume(...).subscribe()`），调用方立即返回，真正的 I/O 落在 Redis
