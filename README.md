@@ -8,7 +8,7 @@
 
 请求处理是一条按 `order` **升序**执行的过滤器链。SCG 把 `GlobalFilter`（全局生效）与路由级
 `GatewayFilter`（由工厂生产、只挂需要的路由）适配成同一条链统一排序——机制见
-[doc/threading-model.md](doc/threading-model.md)，上游调用的接管见
+[doc/threading-model.md](doc/threading-model.md)，后端服务调用的接管见
 [doc/scg-upstream-routing.md](doc/scg-upstream-routing.md)。下表按执行顺序列出全部过滤器：
 
 | 过滤器类 | 类型 | order | 作用 |
@@ -17,18 +17,18 @@
 | ResponseObservationFilter | GlobalFilter | HIGHEST+1 | 读 usage、结算 token、冷却 key |
 | TenantAuthFilter | GlobalFilter | HIGHEST+10 | 租户鉴权与治理 |
 | FirstTokenMetricsFilter | GlobalFilter | -2 | 首字节耗时 TTFT |
-| **NettyWriteResponseFilter** | GlobalFilter | -1 | 写回上游响应体 |
+| **NettyWriteResponseFilter** | GlobalFilter | -1 | 写回后端服务响应体 |
 | RetryAfterFilter | GlobalFilter | 0 | 429 兜底 Retry-After |
 | **RequestRateLimiter** | GatewayFilter | 1 | 租户请求数限流 |
 | **Retry** | GatewayFilter | 1 | 首字节前重试（默认关） |
 | **CircuitBreaker** | GatewayFilter | 2 | 熔断与改道 |
 | ProviderKey | GatewayFilter | 3 | 选 key、换 Authorization |
 | ModelMapping | GatewayFilter | 4 | 改请求 model 名 |
-| **SetPath** | GatewayFilter | 5 | 改上游路径 |
+| **SetPath** | GatewayFilter | 5 | 改后端服务路径 |
 | TokenQuotaFilter | GlobalFilter | 95 | 租户 token 预扣（默认关） |
 | ProviderQuotaFilter | GlobalFilter | 100 | 厂商配额限流 |
-| **RouteToRequestUrlFilter** | GlobalFilter | 10000 | 拼上游 URL |
-| **NettyRoutingFilter** | GlobalFilter | LOWEST | 发起上游 HTTP 调用 |
+| **RouteToRequestUrlFilter** | GlobalFilter | 10000 | 拼后端服务 URL |
+| **NettyRoutingFilter** | GlobalFilter | LOWEST | 发起后端服务 HTTP 调用 |
 | **ForwardRoutingFilter** | GlobalFilter | LOWEST | forward 本地分发 |
 
 几点说明：
@@ -41,7 +41,7 @@
 
 ## 跑起来
 
-上游厂商 key 从环境变量读，不进仓库。网关只认这两个变量，各条路由的 `SetRequestHeader` 引用自己的那家：
+后端服务厂商 key 从环境变量读，不进仓库。网关只认这两个变量，各条路由的 `SetRequestHeader` 引用自己的那家：
 
 ```
 export DASHSCOPE_API_KEY=sk-...
@@ -112,7 +112,7 @@ traceId 由 `spring-boot-starter-opentelemetry` 提供，会作为 `traceparent`
 
 被鉴权挡掉的请求同样计数，且排在鉴权之前——否则「某租户一直拿错 key 打网关」在指标里是隐身的。SCG 自带的 `http_client_requests_seconds` 只有 route 维度，没有租户与厂商，这是自建一条指标的理由。
 
-上游流中途卡住由 `ai-gateway.upstream.idle-timeout` 兜（默认 60s）：路由 metadata 的 `response-timeout` 只管「等响应头」，正文阶段没有超时，见 `docs/requirements.md` 决策 D2。
+后端服务流中途卡住由 `ai-gateway.upstream.idle-timeout` 兜（默认 60s）：路由 metadata 的 `response-timeout` 只管「等响应头」，正文阶段没有超时，见 `docs/requirements.md` 决策 D2。
 
 ## 限流
 
@@ -121,7 +121,7 @@ traceId 由 `spring-boot-starter-opentelemetry` 提供，会作为 `traceparent`
 | 维度 | 桶 | 键 | 挡什么 |
 |---|---|---|---|
 | 租户 | `RequestRateLimiter` + Redis 令牌桶 | `tenant:<租户>` | 单个调用方打爆网关 |
-| 厂商 | 自研 `ProviderQuotaFilter`，Redis 固定窗口 | `provider:<厂商>` | 所有租户合计把上游账户配额打满 |
+| 厂商 | 自研 `ProviderQuotaFilter`，Redis 固定窗口 | `provider:<厂商>` | 所有租户合计把后端服务账户配额打满 |
 
 被限一律 429 + `Retry-After`，请求不会碰到厂商。厂商维度为什么不用第二个 `RequestRateLimiter`、窗口为什么是 60 秒而不是 1 秒，都写在 `docs/requirements.md` 决策 D5。
 
