@@ -1,0 +1,155 @@
+# 网关线程模型：反应式栈为什么不需要业务线程池
+
+承接 `requirements.md` 的边界与 `litellm-alignment-design.md` 的决策。这份文档回答两个问题：
+网关的线程到底怎么跑，以及为什么它不像经典 Netty 服务那样需要一池业务线程。
+
+**结论先行**：区别不在「调 HTTP 还是写业务」，而在「等结果时线程阻不阻塞」。网关调大模型走的是
+端到端非阻塞 I/O，线程发出请求后不等响应、立刻回去服务别的连接，所以不需要额外的业务线程池。
+还要先纠正一个措辞：网关不是「没有线程池」，reactor-netty 的 EventLoopGroup 本身就是个线程池，
+只是它小到核数级别、且绝不被阻塞，所以不必再叠一个业务池。
+
+---
+
+## 一、三条线程 lane
+
+| lane | 线程 | 承载 | 能否阻塞 |
+|---|---|---|---|
+| 请求路径 | reactor-netty event loop（`max(4, CPU 核数)`，入站 server + 出站 client 共享默认 `LoopResources`） | 整条过滤器链、路由、鉴权、限流、key 选取、观测、SSE 转发 | **绝不** |
+| 共享状态 I/O | Lettuce/Redis 自己的 netty event loop | 限流脚本、token 记账、R25 冷却/开闸读写 | 非阻塞（reactive） |
+| 治理调度 | Spring `@Scheduled` 调度线程（默认单线程池） | 探活、余额、熔断同步 | **唯一允许** `.block()` |
+
+### 1. 请求路径：reactor-netty event loop
+入站 WebFlux server 与出站网关 HttpClient 共用 reactor-netty 默认的 `LoopResources`（worker 数
+`max(4, 核数)`，本项目未自定义）。整条过滤器链都跑在这上面：
+
+```
+RequestMetrics(HIGHEST) → ResponseObservation(HIGHEST+1) → TenantAuth(HIGHEST+10)
+→ FirstToken(-2) → RetryAfter(0)
+→ 路由过滤器(Retry / CircuitBreaker / ProviderKey / ModelMapping / SetPath)
+→ TokenQuota(95) → ProviderQuota(100) → RouteToRequestUrl(10000) → NettyWriteResponse
+```
+
+全程返回 `Mono/Flux` 链式拼接，主代码里**没有任何 `publishOn/subscribeOn/boundedElastic`**——
+即没有把活儿甩到弹性线程池，纪律就是「event loop 上不阻塞」。SSE 正文也是 event loop 直接从
+上游连接搬给客户端。
+
+### 2. 共享状态 I/O：Lettuce/Redis event loop
+限流脚本、token 记账、R25 冷却/开闸读写都走 `ReactiveStringRedisTemplate`。写侧一律
+fire-and-forget（`.onErrorResume(...).subscribe()`），调用方立即返回，真正的 I/O 落在 Redis
+客户端自己的 event loop 上，不占网关线程。
+
+### 3. 治理调度：`@Scheduled` 单线程
+`GatewayApplication` 开了 `@EnableScheduling`，未配 `spring.task.scheduling.pool.size` →
+**默认单线程池**。三个定时任务共用这一条线程：
+- `ProviderHealthProbe.probe`（30s，`.block(timeout)`）
+- `ProviderBalanceProbe`（10m，`.block(timeout)`）
+- `SharedBreakerSync.syncOpenBreakers`（5s）
+
+全代码库的 `.block()` **只出现在这三处及其调用链**（探活 WebClient + `SharedState.isOpen`），
+全部在调度线程，绝不碰请求路径。
+
+---
+
+## 二、硬约束：请求路径绝不阻塞
+
+这是整个模型的地基，R25 把它钉得最死。`ProviderKeyGatewayFilterFactory.apply` 在 **event loop 上
+同步**调 `keyPool.pick()` → `isCooling()`，所以同一个 `SharedState` 的两个读方法有两种线程语义：
+
+- **冷却读** `SharedState.isCooling`：必须非阻塞。本地短 TTL 缓存新鲜就答、过期就答旧值并**异步刷新**，
+  绝不在 event loop 上等 Redis。跨实例可见性至多滞后一个 `local-cache-ttl`（D21）。
+- **开闸读** `SharedState.isOpen`：可以有界 `.block(500ms)`，因为它**只被调度线程**
+  （`SharedBreakerSync`）调用。
+
+按「谁在什么线程上调用」来分阻塞与否，而不是按「读什么」——这是反应式栈里最容易踩错的地方。
+观测侧 `ResponseObservationFilter` 的 `doFinally`（结算 token、冷却 key、记指标）跑在响应完成/取消
+的那条线程（通常 event loop），里面 settle/coolDown 也都是非阻塞的。
+
+---
+
+## 三、与经典 Netty + 业务线程池（jaws 式）的对比
+
+> 这里把 jaws 按「Netty I/O 线程 + 业务线程池」的经典模型来对比。若它是某个具体框架、有自己的
+> 线程调度细节，结论仍成立——因为分水岭是阻塞与否，不是框架名字。
+
+### jaws 式：I/O 线程 + 业务线程池
+```
+BossGroup     → accept 连接
+WorkerGroup   → 读写 socket、编解码（EventLoop，一个线程绑一组连接，串行）
+业务线程池     → 执行 handler 里的接口逻辑（JDBC / 同步 RPC / 同步 HTTP …）
+```
+**为什么必须分出业务池**：Netty 的 EventLoop 是「单线程串行处理名下所有连接」。一旦 handler 里做了
+阻塞操作，这条 EventLoop 线程就被钉死，它名下成百上千条连接全部停摆。所以必须把阻塞活儿 offload
+到业务线程池，让 EventLoop 马上回去服务别人。本质是 **thread-per-request**：等结果时线程被 park
+挂起，一个请求独占一个业务线程直到返回 → 线程数 ≈ 并发请求数。
+
+### reactor-netty：只有 event loop
+```
+EventLoopGroup（max(4,核数)，入站 + 出站共享）
+   → 整条过滤器链都在这上面跑，没有业务池
+```
+**为什么敢这么干**：链上没有任何阻塞调用。调大模型用 reactor-netty 的异步 HttpClient——发请求后
+线程不等，而是把「这条连接可读时叫我」注册到 epoll/kqueue，然后返回。上游字节到了，EventLoop 被
+唤醒，接着跑后面的 reactive 链把正文搬给客户端。本质是 **event-loop 多路复用**：线程从不为等 I/O
+而 park，几条线程同时照看成千上万条连接。
+
+### 关键澄清：不是「调 HTTP 就不用线程池」
+最常见的误解。**如果用阻塞式 HTTP 客户端**（`HttpURLConnection`、Apache HttpClient 同步 `execute`、
+OkHttp 同步 `call`）在 EventLoop 上去调大模型，一样会把 EventLoop 钉死——LLM 一个回答动辄几秒到
+几十秒，SSE 流式更是整段流期间线程都动不了。这时照样需要业务线程池，而且因为 LLM 慢、并发高，
+池子得开得巨大。真正的分水岭：
+
+| | 阻塞式调用 | 非阻塞式调用 |
+|---|---|---|
+| 等上游时线程在干嘛 | park 挂起，独占一个线程 | 不等，回去服务别的连接 |
+| 需要的线程数 | ≈ 并发请求数 | ≈ CPU 核数（几个 EventLoop） |
+| 要不要业务线程池 | 要（保护 EventLoop） | 不要 |
+
+网关落在右列，是因为它端到端非阻塞：reactor-netty 异步 client + WebFlux reactive 链 + Lettuce
+reactive Redis + 非阻塞计时器。请求路径里一个 `.block()` 都没有，唯一的阻塞被圈进 `@Scheduled`
+调度线程，那几条线程不在转发路径上。
+
+---
+
+## 四、为什么 LLM 网关特别适合非阻塞
+
+大模型调用的特征是**高延迟、长连接、流式 SSE、I/O 密集但 CPU 轻**：
+- 阻塞模型：一个流式回答 30s 就占一个业务线程 30s，1 万并发 → 1 万线程，内存和上下文切换双爆。
+- 非阻塞模型：1 万条 SSE 连接只是 1 万个 epoll 注册项 + 少量缓冲区，几个 EventLoop 轮询就绪事件
+  即可，**线程数不随并发线性增长**。
+
+这正是反应式栈的主场，也是网关选它的根本原因。
+
+---
+
+## 五、超时/看门狗也在 event loop 层
+
+- **空闲看门狗** `UpstreamIdleTimeoutCustomizer`：给每条上游 channel 挂一个 Netty
+  `ReadTimeoutHandler`（per-channel、带计时状态，不能共享），在 event loop 上计时，连续 idle
+  没读到字节就抛 `ReadTimeoutException` 断连。它管「已经开始回话之后多久没新字节」，与路由
+  metadata 的 `response-timeout`（管「等多久算厂商没回响应头」）不是一回事（R11）。
+- `response-timeout`（首字节预算）、`connect-timeout`（per-route）同样是 reactor-netty 的非阻塞计时。
+
+---
+
+## 六、代价与纪律
+
+非阻塞不是白来的：
+- **代码必须 reactive**（`Mono/Flux` 链），不能写「看着同步」的阻塞代码。一颗老鼠屎（一个 `.block`、
+  一次 JDBC）就能钉死 EventLoop、坏一锅汤——这也是为什么本网关把阻塞严格隔离到调度线程。
+- 栈追踪/调试不直观（异步回调链）。
+- **CPU 密集活儿仍会占 EventLoop**（大 JSON 解析、精确 tokenizer 计数）。真要重活得甩到
+  `boundedElastic`。本网关这类活儿很轻（`ModelsController` 纯内存构建清单），所以没引入弹性池。
+
+两个值得知道的特性（都不是请求路径问题）：
+1. **调度池单线程**：三个定时任务串行，探活/余额是顺序 `.block(timeout)`。厂商多且都超时时，一轮
+   探活可能占住这唯一线程数秒，把 `syncOpenBreakers` 往后推。影响的是治理时效，不影响转发。要提速
+   可配 `spring.task.scheduling.pool.size`。
+2. **`ModelsController`** 是 `@RestController`，在 event loop 上同步构建清单——但纯内存、无 I/O、
+   模型量小，可忽略。
+
+---
+
+一句话总结：**请求转发全程在 reactor-netty event loop 上非阻塞流动，Redis I/O 在 Lettuce 自己的
+loop 上异步跑，所有阻塞被圈进单线程的 `@Scheduled` 调度 lane。** jaws 用业务线程池，是在「允许写
+阻塞逻辑」的前提下保护 I/O 线程；网关不用，是因为它从编程模型上就禁止阻塞，I/O 线程自己就能安全地
+跑完业务逻辑。差别是阻塞 vs 非阻塞，不是 HTTP vs 业务。
