@@ -57,6 +57,12 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
      */
     static final int MODEL_GROUP_ROUTE_ORDER = 990;
 
+    /**
+     * R22 的 {@code /v1/models} 清单路由。它认领的是一个确定的对外路径（与 chat 入口不冲突），
+     * 排在模型组与厂商路由之前；仍然排在手写路由之后，逃生舱照样能顶掉它。
+     */
+    static final int MODELS_ROUTE_ORDER = 900;
+
     /** 组内非首跳的内部路径前缀：只被上一跳的改道命中，不是对外入口。 */
     static final String INTERNAL_PREFIX = "/internal/";
 
@@ -64,6 +70,9 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
 
     /** 对外的 OpenAI 兼容入口。 */
     static final String CHAT_ENTRY = "/v1/chat/completions";
+
+    /** R22：对外的模型清单入口，OpenAI SDK 的 {@code models.list()} 打这里。 */
+    static final String MODELS_ENTRY = "/v1/models";
 
     /** 备份入口的前缀，客户端不该直接打；要点名厂商用 {@code /{alias}/v1/...}。 */
     static final String BACKUP_PREFIX = "/backup/";
@@ -85,7 +94,32 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
             // 里 generatedRoutes 的注释：测试类自带路由表，生产是急停闸）
             return Flux.empty();
         }
-        return Flux.fromIterable(build(properties.getProviders(), properties.getModelGroups()));
+        List<RouteDefinition> routes = build(properties.getProviders(), properties.getModelGroups());
+        if (routes.isEmpty()) {
+            // 没声明 providers 就不产清单路由：清单是从 providers/model-groups 聚合来的，
+            // 无源可聚时挂一条空清单路由没有意义（其余测试类各自注入 routes，不受影响）
+            return Flux.empty();
+        }
+        List<RouteDefinition> out = new ArrayList<>();
+        // R22：清单路由附带产出，走 forward 保留鉴权（D18）。放在最前，order 也已经这样设了
+        out.add(modelsRoute());
+        out.addAll(routes);
+        return Flux.fromIterable(out);
+    }
+
+    /**
+     * R22：{@code GET /v1/models} → {@code forward:/_gateway/models}，由 {@link ModelsController}
+     * 现读配置产清单。不挂任何厂商过滤器（没有 provider 维度），也不挂熔断——它不碰上游。
+     * 鉴权、租户限流、访问日志由全局过滤器链照常施加（决策 D18）。
+     */
+    private RouteDefinition modelsRoute() {
+        RouteDefinition definition = new RouteDefinition();
+        definition.setId("models-list");
+        definition.setUri(java.net.URI.create("forward:" + ModelsController.INTERNAL_PATH));
+        definition.setOrder(MODELS_ROUTE_ORDER);
+        definition.getPredicates().add(predicate("Path=" + MODELS_ENTRY));
+        definition.getPredicates().add(predicate("Method=GET"));
+        return definition;
     }
 
     /** 包级可见：让单测能直接拿声明算出路由，不必起一个上下文。 */
@@ -216,6 +250,10 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
 
     private List<FilterDefinition> hopFilters(String alias, AiGatewayProperties.Provider provider, String nextPath) {
         List<FilterDefinition> filters = new ArrayList<>();
+        if (properties.getRetry().getMaxAttempts() > 0) {
+            // R24：重试在最前（熔断之外），每次重试仍走熔断与改道
+            filters.add(retry());
+        }
         if (nextPath != null) {
             FilterDefinition breaker = new FilterDefinition();
             breaker.setName("CircuitBreaker");
@@ -248,6 +286,11 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
     private List<FilterDefinition> publicFilters(AiGatewayProperties.Provider provider, String alias,
             Map<String, AiGatewayProperties.Provider> providers) {
         List<FilterDefinition> filters = new ArrayList<>();
+        if (properties.getRetry().getMaxAttempts() > 0) {
+            // R24：重试挂在路由过滤器链最前（在 CircuitBreaker 之外）。连接级失败时同一请求内
+            // 重试几次，每次重试仍走熔断与改道；主备都连不上时重试耗尽才失败（D20）。
+            filters.add(retry());
+        }
         FilterDefinition breaker = circuitBreaker(provider, alias, providers);
         if (breaker != null) {
             // 顺序有讲究：熔断要排在改路径、换 key、改写模型名之前。它改道时用的是「自己看到的那个
@@ -280,6 +323,30 @@ public class ProviderRouteDefinitionLocator implements RouteDefinitionLocator {
         definition.addArg("fallbackUri", "forward:" + BACKUP_PREFIX + backup + CHAT_ENTRY);
         // 索引形式与手写 yml 里那条一致：args 会被 ConfigurationService 当属性源绑定到 Set<String>
         definition.addArg("statusCodes[0]", "INTERNAL_SERVER_ERROR");
+        return definition;
+    }
+
+    /**
+     * R24：内置 {@code Retry} 过滤器。保守配置（D20）：只重试 POST 的连接级异常
+     * （{@code IOException}/{@code TimeoutException}，{@code ConnectException} 是 IOException 子类），
+     * <b>不</b>按 HTTP 状态重试——5xx 已带响应体，重试会重复计费。内置默认 {@code series=[SERVER_ERROR]}、
+     * {@code methods=[GET]}，不改等于没配（D3），所以这里显式覆盖：methods 改 POST、series/statuses 绑空串清空。
+     * 流中途断在写响应侧冒出、绕过 Retry 作用域（D6.3），所以“只重试首字节前”是这个配置的天然结果。
+     */
+    private FilterDefinition retry() {
+        AiGatewayProperties.Retry config = properties.getRetry();
+        FilterDefinition definition = new FilterDefinition();
+        definition.setName("Retry");
+        definition.addArg("retries", String.valueOf(config.getMaxAttempts()));
+        definition.addArg("methods[0]", "POST");
+        definition.addArg("exceptions[0]", "java.io.IOException");
+        definition.addArg("exceptions[1]", "java.util.concurrent.TimeoutException");
+        // 清空默认的状态重试：只认异常，不认状态码
+        definition.addArg("series", "");
+        definition.addArg("statuses", "");
+        definition.addArg("backoff.firstBackoff", config.getFirstBackoff().toMillis() + "ms");
+        definition.addArg("backoff.maxBackoff", config.getMaxBackoff().toMillis() + "ms");
+        definition.addArg("backoff.factor", "2");
         return definition;
     }
 

@@ -77,6 +77,12 @@ public class AiGatewayProperties {
     /** 两个维度的配额。 */
     private RateLimit rateLimit = new RateLimit();
 
+    /** 首字节前的请求内重试（R24）。 */
+    private Retry retry = new Retry();
+
+    /** 冷却/熔断状态跨实例共享（R25）。 */
+    private SharedState sharedState = new SharedState();
+
     public Map<String, Tenant> getTenants() {
         return tenants;
     }
@@ -149,6 +155,22 @@ public class AiGatewayProperties {
         this.rateLimit = rateLimit;
     }
 
+    public Retry getRetry() {
+        return retry;
+    }
+
+    public void setRetry(Retry retry) {
+        this.retry = retry;
+    }
+
+    public SharedState getSharedState() {
+        return sharedState;
+    }
+
+    public void setSharedState(SharedState sharedState) {
+        this.sharedState = sharedState;
+    }
+
     /**
      * 限流配额。租户维度交给 spring-cloud-gateway 的 {@code RequestRateLimiter}（它写
      * {@code X-RateLimit-*} 头），厂商维度由 {@code ProviderQuotaFilter} 自己实现——原因见
@@ -177,6 +199,23 @@ public class AiGatewayProperties {
          * 几十秒——按秒开窗等于永远撞不到，所以这里默认 60。
          */
         private int providerWindowSeconds = 60;
+
+        /**
+         * 租户 token 配额（R23）：一个窗口内允许消耗多少 token，0 表示关掉这一维（默认）。
+         * 与请求数桶不同，这一维按「预扣 + 结算」计：请求前按 {@code max_tokens} 预扣，
+         * 响应后按真实 usage 结算差额。窗口长度是 {@link #tokenWindowSeconds}。
+         */
+        private long tenantTokensPerWindow = 0;
+
+        /** token 窗口长度，秒。与厂商窗口同理默认 60：TPM 本就是按分钟给的。 */
+        private int tokenWindowSeconds = 60;
+
+        /**
+         * 请求没带 {@code max_tokens} 时的预扣额。prompt 的精确计数要 tokenizer（新依赖），
+         * 本批只预扣 completion 的有界部分 {@code max_tokens}；没带时用一个保守默认值占位，
+         * 响应后再按真实 usage 结算（决策 D19）。
+         */
+        private long defaultTokenReservation = 1024;
 
         public int getTenantReplenishRate() {
             return tenantReplenishRate;
@@ -216,6 +255,112 @@ public class AiGatewayProperties {
 
         public void setProviderWindowSeconds(int providerWindowSeconds) {
             this.providerWindowSeconds = providerWindowSeconds;
+        }
+
+        public long getTenantTokensPerWindow() {
+            return tenantTokensPerWindow;
+        }
+
+        public void setTenantTokensPerWindow(long tenantTokensPerWindow) {
+            this.tenantTokensPerWindow = tenantTokensPerWindow;
+        }
+
+        public int getTokenWindowSeconds() {
+            return tokenWindowSeconds;
+        }
+
+        public void setTokenWindowSeconds(int tokenWindowSeconds) {
+            this.tokenWindowSeconds = tokenWindowSeconds;
+        }
+
+        public long getDefaultTokenReservation() {
+            return defaultTokenReservation;
+        }
+
+        public void setDefaultTokenReservation(long defaultTokenReservation) {
+            this.defaultTokenReservation = defaultTokenReservation;
+        }
+    }
+
+    /**
+     * 首字节前的请求内重试（R24）。用内置 {@code Retry} 过滤器，由生成器在 {@code max-attempts>0}
+     * 时挂到对外/组路由最前（熔断之外）。只重试连接级异常（{@code IOException}/{@code TimeoutException}），
+     * 不按 HTTP 状态重试——5xx 已带响应体，重试会重复计费（D3/D6.3）。默认 0 关，现有行为不变。
+     */
+    public static class Retry {
+
+        /** 额外重试次数，0 表示不挂 Retry（默认）。 */
+        private int maxAttempts = 0;
+
+        /** 首次退避。 */
+        private java.time.Duration firstBackoff = java.time.Duration.ofMillis(50);
+
+        /** 退避上限。 */
+        private java.time.Duration maxBackoff = java.time.Duration.ofMillis(500);
+
+        public int getMaxAttempts() {
+            return maxAttempts;
+        }
+
+        public void setMaxAttempts(int maxAttempts) {
+            this.maxAttempts = maxAttempts;
+        }
+
+        public java.time.Duration getFirstBackoff() {
+            return firstBackoff;
+        }
+
+        public void setFirstBackoff(java.time.Duration firstBackoff) {
+            this.firstBackoff = firstBackoff;
+        }
+
+        public java.time.Duration getMaxBackoff() {
+            return maxBackoff;
+        }
+
+        public void setMaxBackoff(java.time.Duration maxBackoff) {
+            this.maxBackoff = maxBackoff;
+        }
+    }
+
+    /**
+     * 冷却/熔断状态跨实例共享（R25）。多实例时「A 判死的厂商/key，B 还在敲」——把 key 冷却与熔断
+     * 开闸信号放进 Redis 共享。默认 {@code false}：关闭时密钥池走纯本地、不注册熔断监听、不起同步、
+     * 不碰 Redis，现有行为逐条不变（决策 D21）。Redis 不可达一律退回本地，绝不把它的可用性乘进网关。
+     */
+    public static class SharedState {
+
+        /** 总开关，默认关。 */
+        private boolean enabled = false;
+
+        /** 熔断开闸标记的同步间隔。代价是至多一个间隔的延迟，比实时 pub/sub 简单（D21）。 */
+        private java.time.Duration syncInterval = java.time.Duration.ofSeconds(5);
+
+        /** 远端冷却标记的本地缓存时长：选取在 reactor 线程上同步发生，靠它把每请求 Redis 压力降下来。 */
+        private java.time.Duration localCacheTtl = java.time.Duration.ofSeconds(2);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public java.time.Duration getSyncInterval() {
+            return syncInterval;
+        }
+
+        public void setSyncInterval(java.time.Duration syncInterval) {
+            this.syncInterval = syncInterval;
+        }
+
+        public java.time.Duration getLocalCacheTtl() {
+            return localCacheTtl;
+        }
+
+        public void setLocalCacheTtl(java.time.Duration localCacheTtl) {
+            this.localCacheTtl = localCacheTtl;
         }
     }
 

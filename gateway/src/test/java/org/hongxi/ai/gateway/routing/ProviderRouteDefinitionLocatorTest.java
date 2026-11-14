@@ -195,4 +195,39 @@ class ProviderRouteDefinitionLocatorTest {
     private static RouteDefinition routeById(List<RouteDefinition> routes, String id) {
         return routes.stream().filter(definition -> id.equals(definition.getId())).findFirst().orElseThrow();
     }
+
+    /** R24：默认 max-attempts=0 时不挂 Retry，现有行为不变。 */
+    @Test
+    void retryFilterIsAbsentByDefault() {
+        assertThat(twoProviders("dashscope", "deepseek"))
+                .allSatisfy(route -> assertThat(filterNames(route)).doesNotContain("Retry"));
+    }
+
+    /** R24：启用后 Retry 挂在对外路由最前（熔断之外），且只重试 POST 异常、不按状态。 */
+    @Test
+    void retryFilterLeadsPublicRoutesWhenEnabled() {
+        AiGatewayProperties properties = new AiGatewayProperties();
+        properties.getRetry().setMaxAttempts(2);
+        Map<String, AiGatewayProperties.Provider> providers = decl(
+                "dashscope", provider("https://dashscope.aliyuncs.com", "/compatible-mode/v1/chat/completions",
+                        "deepseek", List.of()),
+                "deepseek", provider("https://api.deepseek.com", "/v1/chat/completions", "dashscope",
+                        List.of("deepseek*")));
+
+        List<RouteDefinition> routes = new ProviderRouteDefinitionLocator(properties).build(providers);
+
+        RouteDefinition publicRoute = routeById(routes, "deepseek-by-model");
+        assertThat(filterNames(publicRoute))
+                .containsExactly("Retry", "CircuitBreaker", "ProviderKey", "ModelMapping", "SetPath");
+        FilterDefinition retry = publicRoute.getFilters().get(0);
+        assertThat(retry.getArgs())
+                .containsEntry("retries", "2")
+                .containsEntry("methods[0]", "POST")
+                .containsEntry("exceptions[0]", "java.io.IOException")
+                // 清空默认的状态重试：只认异常不认状态码（5xx 重试会重复计费）
+                .containsEntry("series", "")
+                .containsEntry("statuses", "");
+        // 备份路由是最后防线，不挂 Retry
+        assertThat(filterNames(routeById(routes, "backup-deepseek"))).doesNotContain("Retry");
+    }
 }

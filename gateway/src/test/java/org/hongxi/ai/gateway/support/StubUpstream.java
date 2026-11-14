@@ -56,7 +56,9 @@ public final class StubUpstream implements AutoCloseable {
         /** 429 + OpenAI 兼容限流体：R16 用它验证"被限流的那把 key 单独冷却"。 */
         TOO_MANY_REQUESTS,
         /** 200 + 账户余额体：R18 用它验"取数"，含数字字符串、嵌套路径与单位。 */
-        JSON_200_BALANCE
+        JSON_200_BALANCE,
+        /** 第一发把连接弄断（首字节前）、之后正常回 JSON：R24 用它验请求内重试。 */
+        RESET_ONCE_THEN_ECHO
     }
 
     /** 稳定节奏场景里每块的间隔。 */
@@ -75,6 +77,8 @@ public final class StubUpstream implements AutoCloseable {
     private final AtomicReference<String> body = new AtomicReference<>();
     private final AtomicReference<String> contentLength = new AtomicReference<>();
     private final AtomicInteger requests = new AtomicInteger();
+    /** RESET_ONCE_THEN_ECHO 场景的发数计数：第 0 发断连，其余正常。reset() 里清零。 */
+    private final AtomicInteger failOnceCounter = new AtomicInteger();
     private final List<String> paths = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private StubUpstream(DisposableServer server) {
@@ -143,6 +147,7 @@ public final class StubUpstream implements AutoCloseable {
 
     public void reset() {
         requests.set(0);
+        failOnceCounter.set(0);
         paths.clear();
     }
 
@@ -190,6 +195,15 @@ public final class StubUpstream implements AutoCloseable {
                             // "Error starting response. Replying error status" 就是证据）。
                             response.withConnection(connection -> connection.channel().close());
                             yield Mono.empty();
+                        }
+                        case RESET_ONCE_THEN_ECHO -> {
+                            // 第一发在首字节前断连（网关侧是 PrematureCloseException，IOException 子类），
+                            // 之后正常回 JSON——R24 的请求内重试该把第二发接住。
+                            if (failOnceCounter.getAndIncrement() == 0) {
+                                response.withConnection(connection -> connection.channel().close());
+                                yield Mono.empty();
+                            }
+                            yield json(response);
                         }
                     };
                 });

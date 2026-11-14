@@ -32,6 +32,8 @@ import org.springframework.web.server.ServerWebExchange;
 
 import org.hongxi.ai.gateway.auth.TenantAuthFilter;
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
+import org.hongxi.ai.gateway.ratelimit.TokenQuotaFilter;
+import org.hongxi.ai.gateway.ratelimit.TokenQuotaService;
 import org.hongxi.ai.gateway.routing.UpstreamKeyPool;
 import org.hongxi.ai.gateway.routing.ModelMappingGatewayFilterFactory;
 import org.hongxi.ai.gateway.routing.ModelRoutePredicateFactory;
@@ -89,12 +91,16 @@ public class ResponseObservationFilter implements GlobalFilter, Ordered {
 
     private final UpstreamKeyPool keyPool;
 
+    /** R23：token 预扣的结算。复用本观察者拿到的 usage，不另起一个读字节的（D11/D19）。 */
+    private final TokenQuotaService tokenQuota;
+
     public ResponseObservationFilter(MeterRegistry registry, CircuitBreakerRegistry circuitBreakers,
-            AiGatewayProperties properties, UpstreamKeyPool keyPool) {
+            AiGatewayProperties properties, UpstreamKeyPool keyPool, TokenQuotaService tokenQuota) {
         this.registry = registry;
         this.circuitBreakers = circuitBreakers;
         this.properties = properties;
         this.keyPool = keyPool;
+        this.tokenQuota = tokenQuota;
     }
 
     /** 一次调用采到的四个数。整体缺席时压根不产出这个对象，而不是全 0。 */
@@ -185,6 +191,14 @@ public class ResponseObservationFilter implements GlobalFilter, Ordered {
             if (rawKey instanceof String key) {
                 keyPool.coolDown(provider, key);
             }
+        }
+
+        // R23：把这次调用的真实用量回灌 token 限流器。预约是请求阶段写进属性的（TokenQuotaFilter），
+        // 外层读得到（D11）；usage 与 successfulHttp 正是本观察者已经算好的，不另读一遍字节。
+        // 被 TokenQuotaFilter 自己 429 的请求没写预约属性，这里什么都不做。
+        if (exchange.getAttributes().get(TokenQuotaFilter.RESERVATION_ATTRIBUTE)
+                instanceof TokenQuotaService.Reservation reservation) {
+            tokenQuota.settle(reservation, successfulHttp, usage);
         }
 
         writeLine(exchange, started, signal, tenant, route, provider, status, firstByteNanos, usage, semantic);

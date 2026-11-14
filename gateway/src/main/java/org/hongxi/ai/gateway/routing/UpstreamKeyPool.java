@@ -11,9 +11,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import org.hongxi.ai.gateway.config.AiGatewayProperties;
+import org.hongxi.ai.gateway.resilience.SharedState;
 
 /**
  * R16：一家厂商多把上游 key 时的选取与冷却。
@@ -53,10 +55,21 @@ public class UpstreamKeyPool {
     /** 冷却到期时刻，按 {@code provider|指纹} 存。 */
     private final Map<String, Instant> coolingUntil = new ConcurrentHashMap<>();
 
+    /** R25：跨实例共享冷却。可为 null（纯本地构造）；默认关时即使非 null 也全程 no-op。 */
+    private final SharedState sharedState;
+
+    /** 纯本地构造（测试与默认关时用）：不接共享状态，冷却只在本 JVM 内可见。 */
     public UpstreamKeyPool(AiGatewayProperties properties, MeterRegistry registry, Clock clock) {
+        this(properties, registry, clock, null);
+    }
+
+    @Autowired
+    public UpstreamKeyPool(AiGatewayProperties properties, MeterRegistry registry, Clock clock,
+            SharedState sharedState) {
         this.properties = properties;
         this.registry = registry;
         this.clock = clock;
+        this.sharedState = sharedState;
     }
 
     /**
@@ -100,19 +113,24 @@ public class UpstreamKeyPool {
             return;
         }
         coolingUntil.put(slot(provider, rawKey), clock.instant().plus(cooldown));
+        // R25：同时让别的实例看到这把 key 在冷却（默认关时 sharedState 为 null 或 disabled，no-op）
+        if (sharedState != null) {
+            sharedState.markCooling(provider, fingerprint(rawKey), cooldown);
+        }
     }
 
     public boolean isCooling(String provider, String rawKey) {
-        Instant until = coolingUntil.get(slot(provider, rawKey));
-        if (until == null) {
-            return false;
+        String slot = slot(provider, rawKey);
+        Instant until = coolingUntil.get(slot);
+        if (until != null) {
+            if (until.isAfter(clock.instant())) {
+                return true;
+            }
+            // 到期就顺手清掉，不让这张表只增不减
+            coolingUntil.remove(slot, until);
         }
-        if (until.isAfter(clock.instant())) {
-            return true;
-        }
-        // 到期就顺手清掉，不让这张表只增不减
-        coolingUntil.remove(slot(provider, rawKey), until);
-        return false;
+        // R25：本地没在冷却时再问跨实例共享（非阻塞、缓存兜底）。默认关时直接 false，行为与现状一致。
+        return sharedState != null && sharedState.isCooling(provider, fingerprint(rawKey));
     }
 
     /** 末四位；短于四位的 key 不给任何部分，避免"指纹"其实接近原文。 */

@@ -56,14 +56,18 @@ public class ProviderHealthProbe {
 
     private final MeterRegistry registry;
 
+    /** R25：探活治愈收闸时顺手清远端开闸标记（默认关时 no-op）。 */
+    private final SharedState sharedState;
+
     /** 每个厂商一份健康位，gauge 绑在它上面；缺省 0（未知当不健康，看板才不会被老数据骗）。 */
     private final Map<String, AtomicInteger> health = new ConcurrentHashMap<>();
 
     public ProviderHealthProbe(AiGatewayProperties properties, CircuitBreakerRegistry circuitBreakers,
-            MeterRegistry registry) {
+            MeterRegistry registry, SharedState sharedState) {
         this.properties = properties;
         this.circuitBreakers = circuitBreakers;
         this.registry = registry;
+        this.sharedState = sharedState;
     }
 
     /**
@@ -123,6 +127,8 @@ public class ProviderHealthProbe {
                 outcome("healed", alias);
                 if (breaker.getState() != CircuitBreaker.State.CLOSED) {
                     breaker.transitionToClosedState();
+                    // R25：收闸顺手清远端开闸标记，让别的实例也不再绕开这家（默认关时 no-op）
+                    sharedState.markClosed(alias);
                     log.info("厂商 '{}' 探活返回 {}，熔断收闸", alias, status);
                 }
             }

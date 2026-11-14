@@ -29,6 +29,15 @@ public final class RateLimitTestSupport {
     /** ProviderQuotaFilter 的固定窗口键，同样要清场。 */
     public static final String PROVIDER_WINDOW_KEY_PATTERN = "ai-gateway:provider:*";
 
+    /** TokenQuotaService 的租户 token 窗口键（R23），用例之间也要清场。 */
+    public static final String TOKEN_WINDOW_KEY_PATTERN = "ai-gateway:tokens:*";
+
+    /** SharedState 的 key 冷却键（R25），用例之间清场。 */
+    public static final String COOLDOWN_KEY_PATTERN = "ai-gateway:cooldown:*";
+
+    /** SharedState 的熔断开闸键（R25），用例之间清场。 */
+    public static final String BREAKER_KEY_PATTERN = "ai-gateway:breaker:*";
+
     private RateLimitTestSupport() {
     }
 
@@ -64,12 +73,24 @@ public final class RateLimitTestSupport {
     public static void flushBuckets(ReactiveStringRedisTemplate redis) {
         List<String> keys = redis.keys(BUCKET_KEY_PATTERN).collectList().block(Duration.ofSeconds(5));
         List<String> windows = redis.keys(PROVIDER_WINDOW_KEY_PATTERN).collectList().block(Duration.ofSeconds(5));
+        List<String> tokens = redis.keys(TOKEN_WINDOW_KEY_PATTERN).collectList().block(Duration.ofSeconds(5));
+        List<String> cooldowns = redis.keys(COOLDOWN_KEY_PATTERN).collectList().block(Duration.ofSeconds(5));
+        List<String> breakers = redis.keys(BREAKER_KEY_PATTERN).collectList().block(Duration.ofSeconds(5));
         List<String> all = new java.util.ArrayList<>();
         if (keys != null) {
             all.addAll(keys);
         }
         if (windows != null) {
             all.addAll(windows);
+        }
+        if (tokens != null) {
+            all.addAll(tokens);
+        }
+        if (cooldowns != null) {
+            all.addAll(cooldowns);
+        }
+        if (breakers != null) {
+            all.addAll(breakers);
         }
         if (!all.isEmpty()) {
             redis.delete(Flux.fromIterable(all)).block(Duration.ofSeconds(5));

@@ -49,6 +49,10 @@ public final class RequestBodyModels {
     public record Resolved(String model, ServerWebExchange continued) {
     }
 
+    /** R23：读到的请求体字节 + 应当继续往下传的 exchange。字节只用来取 {@code max_tokens}，不改报文。 */
+    public record BodyBytes(byte[] bytes, ServerWebExchange continued) {
+    }
+
     /**
      * 取本请求的 {@code model}。已经有谓词解析过的直接复用；没有 JSON 正文的（GET、无 body）返回
      * {@code null} 且不碰流；其余情况缓存并重放。
@@ -82,6 +86,55 @@ public final class RequestBodyModels {
         }
         catch (Exception unparsable) {
             return null;
+        }
+    }
+
+    /**
+     * R23：只读请求体字节，取 {@code max_tokens} 用。与 {@link #resolve} 不同，它<b>不重放</b>已缓存
+     * 的体：走到这里时 {@code ModelMapping} 已经把改好名的可重放体交下去了，拿缓存里的<b>原始</b>
+     * 字节再重放一遍会把 D9 的改名覆盖掉。所以缓存命中时只读字节、continued 就是当前 exchange。
+     *
+     * <p>缓存里存的是 {@link DataBuffer}（{@code Model} 谓词与 {@code ModelMapping} 都用
+     * {@code cacheRequestBody} 存它）。{@link DataBuffer#toString(java.nio.charset.Charset)} 按 position
+     * 取数、不推 readerIndex，与响应侧 peek 同一手法（D1），读它不会消费掉下游要用的体。
+     * 还没人缓存过（无 Model 谓词且映射为空的点名路由）才就地缓存并重放。
+     */
+    public static Mono<BodyBytes> readBody(ServerWebExchange exchange) {
+        Object cached = exchange.getAttribute(ServerWebExchangeUtils.CACHED_REQUEST_BODY_ATTR);
+        if (cached instanceof DataBuffer buffer) {
+            byte[] bytes = buffer.toString(java.nio.charset.StandardCharsets.UTF_8)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            return Mono.just(new BodyBytes(bytes, exchange));
+        }
+        if (!isJson(exchange)) {
+            return Mono.just(new BodyBytes(new byte[0], exchange));
+        }
+        return ServerWebExchangeUtils.cacheRequestBody(exchange, request ->
+                        ServerRequest.create(exchange.mutate().request(request).build(), READERS)
+                                .bodyToMono(byte[].class)
+                                .defaultIfEmpty(new byte[0]))
+                .map(bytes -> new BodyBytes(bytes, replay(exchange, bytes)));
+    }
+
+    /**
+     * R23 预扣额：请求体里的 {@code max_tokens}（>0 时），否则退到 {@code fallback}。纯函数，
+     * 单测不起上下文。只预扣 completion 的有界部分；prompt 精确计数要 tokenizer，留后续（D19）。
+     * 不是合法 JSON、没有该字段、值非正都退到 fallback——宁可多预扣不可少预扣。
+     */
+    public static long maxTokensOf(byte[] bytes, long fallback) {
+        if (bytes == null || bytes.length == 0) {
+            return fallback;
+        }
+        try {
+            JsonNode root = MAPPER.readTree(bytes);
+            JsonNode maxTokens = root.path("max_tokens");
+            if (maxTokens.isNumber() && maxTokens.asLong() > 0) {
+                return maxTokens.asLong();
+            }
+            return fallback;
+        }
+        catch (Exception unparsable) {
+            return fallback;
         }
     }
 

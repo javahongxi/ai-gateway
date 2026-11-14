@@ -123,6 +123,14 @@ ai-gateway:
   # 信它等于让令牌自己挑自己的来源。只有前面确实有一台会覆写该头的代理时才打开。
   trust-forwarded-for: false
 
+  # 冷却/熔断状态跨实例共享（R25）。默认关：单实例、或不想把 Redis 可用性乘进网关时保持纯本地。
+  # 打开后：key 冷却实时写 Redis（选取侧非阻塞读、本地短 TTL 缓存降压，跨实例可见至多滞后 local-cache-ttl）；
+  # 熔断开闸秒级定时同步、只开不关（收闸仍归本地探活/半开，守 D12/D13 单一写者）。Redis 不可达一律退回本地。
+  shared-state:
+    enabled: false
+    sync-interval: 5s
+    local-cache-ttl: 2s
+
   tenants:
     team-a:
       # 本地开发用的网关 key，与厂商 key 无关；上生产由 GATEWAY_TENANT_KEY 覆盖
