@@ -13,35 +13,31 @@
 
 | 过滤器类 | 类型 | order | 作用 |
 |---|---|---|---|
-| `RequestMetricsFilter` | GlobalFilter·自研 | `HIGHEST_PRECEDENCE`（MIN_VALUE） | 按租户+厂商+状态记请求指标，含被鉴权挡掉的；排最前 |
-| `ResponseObservationFilter` | GlobalFilter·自研 | `HIGHEST_PRECEDENCE + 1` | 响应侧单一观察者：读 usage、结算 token、冷却 key、记响应指标与访问日志 |
-| `TenantAuthFilter` | GlobalFilter·自研 | `HIGHEST_PRECEDENCE + 10` | 租户鉴权（Bearer key→租户）+ 来源地址/到期/模型白名单治理 |
-| `FirstTokenMetricsFilter` | GlobalFilter·自研 | `-2` | 记 TTFT（进入网关到首字节交给客户端） |
-| `NettyWriteResponseFilter` | GlobalFilter·内置 | `-1` | 把上游响应体写回客户端（响应阶段 `.then()` 才执行） |
-| `RetryAfterFilter` | GlobalFilter·自研 | `0` | 给 429 兜底 `Retry-After` 头 |
-| `RequestRateLimiter` | GatewayFilter·内置·default | `1` | 租户请求数令牌桶限流（Redis），写 `X-RateLimit-*` 头 |
-| `Retry` | GatewayFilter·内置·路由 | `1` | 首字节前请求内重试（R24，默认关） |
-| `CircuitBreaker` | GatewayFilter·内置·路由 | `2` | 熔断 + `forward` 改道到备份 |
-| `ProviderKeyGatewayFilterFactory` | GatewayFilter·自研·路由 | `3` | 选厂商 key、换 `Authorization`、登记冷却（R16） |
-| `ModelMappingGatewayFilterFactory` | GatewayFilter·自研·路由 | `4` | 请求侧改 `model` 名（客户端名→厂商名，D9） |
-| `SetPath` | GatewayFilter·内置·路由 | `5` | 改上游路径为厂商 `chat-path` |
-| `TokenQuotaFilter` | GlobalFilter·自研 | `95` | 租户 token 预扣（R23，默认关） |
-| `ProviderQuotaFilter` | GlobalFilter·自研 | `100` | 厂商配额固定窗口限流（Redis） |
-| `RouteToRequestUrlFilter` | GlobalFilter·内置 | `10000` | 拼最终上游 URL（`GATEWAY_REQUEST_URL_ATTR`） |
-| `NettyRoutingFilter` | GlobalFilter·内置 | `LOWEST_PRECEDENCE`（MAX_VALUE） | 用 reactor-netty `HttpClient` 真正发起上游 HTTP 调用 |
-| `ForwardRoutingFilter` | GlobalFilter·内置 | `LOWEST_PRECEDENCE` | `forward:` 路由本地分发（`/v1/models`、备份改道），与上一行按 scheme 互斥 |
+| RequestMetricsFilter | GlobalFilter | HIGHEST | 请求指标（含被拒） |
+| ResponseObservationFilter | GlobalFilter | HIGHEST+1 | 读 usage、结算 token、冷却 key |
+| TenantAuthFilter | GlobalFilter | HIGHEST+10 | 租户鉴权与治理 |
+| FirstTokenMetricsFilter | GlobalFilter | -2 | 首字节耗时 TTFT |
+| **NettyWriteResponseFilter** | GlobalFilter | -1 | 写回上游响应体 |
+| RetryAfterFilter | GlobalFilter | 0 | 429 兜底 Retry-After |
+| **RequestRateLimiter** | GatewayFilter | 1 | 租户请求数限流 |
+| **Retry** | GatewayFilter | 1 | 首字节前重试（默认关） |
+| **CircuitBreaker** | GatewayFilter | 2 | 熔断与改道 |
+| ProviderKey | GatewayFilter | 3 | 选 key、换 Authorization |
+| ModelMapping | GatewayFilter | 4 | 改请求 model 名 |
+| **SetPath** | GatewayFilter | 5 | 改上游路径 |
+| TokenQuotaFilter | GlobalFilter | 95 | 租户 token 预扣（默认关） |
+| ProviderQuotaFilter | GlobalFilter | 100 | 厂商配额限流 |
+| **RouteToRequestUrlFilter** | GlobalFilter | 10000 | 拼上游 URL |
+| **NettyRoutingFilter** | GlobalFilter | LOWEST | 发起上游 HTTP 调用 |
+| **ForwardRoutingFilter** | GlobalFilter | LOWEST | forward 本地分发 |
 
 几点说明：
 
-- **order 决定链上位置，不等于「先做完」**：`ResponseObservationFilter`、`FirstTokenMetricsFilter`、
-  `NettyWriteResponseFilter` 的主要动作在响应阶段（`.then()`/`doFinally`）才发生，虽然位置靠前。
-- **路由级过滤器的 order 由装配位置决定**（第 N 个 = N，见 SCG `RouteDefinitionRouteLocator`）。
-  default-filter 先于路由过滤器加载，同 order 时稳定排序靠前（故 `RequestRateLimiter` 在 `Retry` 前）。
-  上表按 `Retry`+`CircuitBreaker` 都启用列；关掉某个时后续位置前移，**相对顺序不变**。
-- **`CircuitBreaker` 必须在 `ProviderKey`/`ModelMapping`/`SetPath` 之前**（D6.1：改道重投递时
-  鉴权不能读到已换进去的厂商 key，否则 401）。
-- **默认关**：`Retry`（R24 `max-attempts=0`）默认不挂到路由；`TokenQuotaFilter`（R23 配额 0）仍在链上
-  但空转（不读体、不碰 Redis）。
+- 类名**加粗**为 SCG 内置，其余自研；`ProviderKey`/`ModelMapping` 是自研工厂的过滤器名（类带 `GatewayFilterFactory` 后缀）。
+- **order 决定链上位置，不等于「先做完」**：`ResponseObservationFilter`、`FirstTokenMetricsFilter`、`NettyWriteResponseFilter` 的主要动作在响应阶段（`.then()`/`doFinally`）才发生。
+- **路由级过滤器 order 由装配位置决定**（第 N 个 = N）；default-filter 先加载，同 order 稳定排序靠前（`RequestRateLimiter` 在 `Retry` 前）。表中按 `Retry`+`CircuitBreaker` 都启用列，关掉某个时后续前移、**相对顺序不变**。
+- **`CircuitBreaker` 必须在 `ProviderKey`/`ModelMapping`/`SetPath` 之前**（D6.1：改道重投递时鉴权不能读到厂商 key，否则 401）。
+- **默认关**：`Retry`（R24）默认不挂路由；`TokenQuotaFilter`（R23 配额 0）在链上但空转。
 
 ## 跑起来
 
