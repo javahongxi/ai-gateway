@@ -103,9 +103,18 @@ EventLoopGroup（max(4,核数)，入站 + 出站共享）
    → 整条过滤器链都在这上面跑，没有业务池
 ```
 **为什么敢这么干**：链上没有任何阻塞调用。调大模型用 reactor-netty 的异步 HttpClient——发请求后
-线程不等，而是把「这条连接可读时叫我」注册到 epoll/kqueue，然后返回。上游字节到了，EventLoop 被
+线程不等，而是把「这条**上游连接**可读时叫我」注册到 epoll/kqueue，然后返回。上游字节到了，EventLoop 被
 唤醒，接着跑后面的 reactive 链把正文搬给客户端。本质是 **event-loop 多路复用**：线程从不为等 I/O
 而 park，几条线程同时照看成千上万条连接。
+
+**两条连接都在 epoll 上**：注册的不止上游这一条——客户端 → 网关的下游连接由 reactor-netty 的
+HttpServer 管理，同样注册在 event loop 上，且入站 + 出站共享同一个 EventLoopGroup。一次转发实际
+涉及两条连接、两个 epoll 注册项：
+- 下游连接可读 → EventLoop 读到客户端请求 → 跑过滤器链 → 异步发给上游；
+- 上游连接可读 → EventLoop 读到响应字节 → 沿 reactive 链搬回下游连接写给客户端。
+
+上面 HttpClient 那段强调的只是**出站方向不阻塞**：请求发出去后线程不等上游回话，回去服务别的连接；
+把正文搬给客户端是另一段事，属于上游可读事件触发之后的 reactive 链。
 
 ### 关键澄清：不是「调 HTTP 就不用线程池」
 最常见的误解。**如果用阻塞式 HTTP 客户端**（`HttpURLConnection`、Apache HttpClient 同步 `execute`、
