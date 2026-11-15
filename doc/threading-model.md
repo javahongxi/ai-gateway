@@ -81,12 +81,9 @@ fire-and-forget（`.onErrorResume(...).subscribe()`），调用方立即返回�
 
 ---
 
-## 三、与经典 Netty + 业务线程池（jaws 式）的对比
+## 三、与 jaws（Netty I/O 线程 + 业务线程池）的对比
 
-> 这里把 jaws 按「Netty I/O 线程 + 业务线程池」的经典模型来对比。若它是某个具体框架、有自己的
-> 线程调度细节，结论仍成立——因为分水岭是阻塞与否，不是框架名字。
-
-### jaws 式：I/O 线程 + 业务线程池
+### jaws：I/O 线程 + 业务线程池
 ```
 BossGroup     → accept 连接
 WorkerGroup   → 读写 socket、编解码（EventLoop，一个线程绑一组连接，串行）
@@ -94,8 +91,19 @@ WorkerGroup   → 读写 socket、编解码（EventLoop，一个线程绑一组�
 ```
 **为什么必须分出业务池**：Netty 的 EventLoop 是「单线程串行处理名下所有连接」。一旦 handler 里做了
 阻塞操作，这条 EventLoop 线程就被钉死，它名下成百上千条连接全部停摆。所以必须把阻塞活儿 offload
-到业务线程池，让 EventLoop 马上回去服务别人。本质是 **thread-per-request**：等结果时线程被 park
-挂起，一个请求独占一个业务线程直到返回 → 线程数 ≈ 并发请求数。
+到业务线程池，让 EventLoop 马上回去服务别人。
+
+**但 jaws 的业务池是 thread-per-blocking-work，不是 thread-per-request**——后者是对它最常见的误描述：
+- **服务端内部早已全链路异步**：三种传输统一 `serverExecutor.execute()` 卸载后走 `handleAsync()`；
+  `DefaultProvider.invoke` 对返回 `CompletableFuture` 的异步 provider 只做 `orTimeout` 包装，业务线程
+  派发完立即释放，并不独占请求全程——框架自己并不为等 I/O 而 park。
+- **真正 park 线程的是消费端同步调用**：`DefaultResponseFuture.getValue()` 委托 `CompletableFuture.get()`，
+  调用线程被挂起直到结果返回。这一侧才是 thread-per-request。
+- **线程数也不随并发线性增长**：`AbstractNettyServer` 的业务池是 bounded + `AbortPolicyWithStats`
+  fail-fast，封顶在 `maxWorkerThreads`，满了直接拒绝，而不是按并发数开线程。
+
+所以 jaws 的池子存在是为了隔离「用户可能阻塞的业务代码」，而不是框架自己在等 I/O 时 park。按下文的
+分水岭理论，这恰恰印证了它设计的合理性：阻塞活儿被甩出去，I/O 线程保持非阻塞。
 
 ### reactor-netty：只有 event loop
 ```
@@ -174,6 +182,6 @@ reactive Redis + 非阻塞计时器。请求路径里一个 `.block()` 都没有
 ---
 
 一句话总结：**请求转发全程在 reactor-netty event loop 上非阻塞流动，Redis I/O 在 Lettuce 自己的
-loop 上异步跑，所有阻塞被圈进单线程的 `@Scheduled` 调度 lane。** jaws 用业务线程池，是在「允许写
-阻塞逻辑」的前提下保护 I/O 线程；网关不用，是因为它从编程模型上就禁止阻塞，I/O 线程自己就能安全地
-跑完业务逻辑。差别是阻塞 vs 非阻塞，不是 HTTP vs 业务。
+loop 上异步跑，所有阻塞被圈进单线程的 `@Scheduled` 调度 lane。** jaws 用业务线程池隔离用户可能阻塞的
+业务代码、保护 I/O 线程（其服务端框架自身已全链路异步）；网关不用，是因为它从编程模型上就禁止阻塞，
+I/O 线程自己就能安全地跑完业务逻辑。差别是阻塞 vs 非阻塞，不是 HTTP vs 业务。
